@@ -1,0 +1,17 @@
+[package]
+name = "media_engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = { version = "0.22", features = ["ndarray"] }
+ndarray = "0.15"
+ffmpeg-next = { version = "7.0", features = ["static", "build"], default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
