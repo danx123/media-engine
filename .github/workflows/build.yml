@@ -26,6 +26,7 @@ jobs:
         with:
           msystem: MINGW64
           update: true
+          path-type: inherit
           install: >-
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-nasm
@@ -67,13 +68,15 @@ jobs:
 
       - name: ⚙️ Kompilasi FFmpeg Statis + Modul
         timeout-minutes: 60
-        shell: pwsh
+        shell: msys2 {0}
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
           # dtolnay/rust-toolchain gak otomatis ganti default host target,
           # jadi kita paksa cargo/maturin pakai target gnu di sini.
           CARGO_BUILD_TARGET: x86_64-pc-windows-gnu
+          CC: gcc
+          CXX: g++
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist
 
       - name: 📋 Hasil
