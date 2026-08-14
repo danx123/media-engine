@@ -24,7 +24,6 @@ jobs:
           msystem: MINGW64
           update: true
           path-type: inherit
-          # ➕ DITAMBAHKAN: mingw-w64-x86_64-clang agar bindgen Rust tidak error
           install: >-
             mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-nasm
@@ -42,13 +41,10 @@ jobs:
         env:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
-          # Memastikan toolchain MSYS2 terdeteksi paling awal
           echo "$env:MSYS2_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "$env:MSYS2_LOCATION\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          # ➕ DITAMBAHKAN: Memberitahu Rust bindgen di mana letak libclang MSYS2
           echo "LIBCLANG_PATH=$env:MSYS2_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # ⚙️ UBAH: Set toolchain utama (host) langsung ke GNU agar tidak dianggap cross-compile
       - name: Pasang Rust (GNU Host)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -73,10 +69,22 @@ jobs:
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-          CC: gcc
-          CXX: g++
-        # Target argumen bisa dilepas karena default toolchain sudah GNU
+          # 1. Netralkan CFLAGS agar tidak memicu error arsitektur CPU di VM
+          CFLAGS: "-O2"
+          CXXFLAGS: "-O2"
+          # 2. Paksa path temporary ke format POSIX agar bash configure tidak error
+          TMPDIR: "/tmp"
+          TEMP: "/tmp"
+          TMP: "/tmp"
         run: maturin build --release --out dist
+
+      # 3. 🚨 DITAMBAHKAN: Auto-Print config.log kalau maturin masih gagal
+      - name: 🚨 Debug Log FFmpeg (Jika Gagal)
+        if: failure()
+        shell: msys2 {0}
+        run: |
+          echo "==== MENCARI DAN MENCETAK CONFIG.LOG ===="
+          find target -name "config.log" -exec cat {} \;
 
       - name: 📋 Hasil
         run: dir dist/
