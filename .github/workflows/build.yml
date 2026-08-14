@@ -12,12 +12,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pasang MSYS2 + Toolchain Lengkap
+      # 1. Pasang Lingkungan MSYS2 beserta FFmpeg Pre-built
+      - name: Pasang MSYS2 + FFmpeg Pre-built
         id: msys2
         uses: msys2/setup-msys2@v2
         with:
@@ -26,30 +27,23 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-nasm
             mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-clang
-            make
-            diffutils
-            autoconf
-            automake
-            libtool
-            patch
+            mingw-w64-x86_64-ffmpeg
 
-      - name: Setup Environment (PATH & LIBCLANG)
+      # 2. Daftarkan path compiler dan library MSYS2 agar terdeteksi
+      - name: Setup Environment (PATH)
         shell: pwsh
         env:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: |
           echo "$env:MSYS2_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           echo "$env:MSYS2_LOCATION\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "LIBCLANG_PATH=$env:MSYS2_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Pasang Rust (GNU Host)
+      # 3. Sinkronisasi compiler Rust ke lingkungan GNU
+      - name: Pasang Rust (GNU)
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-gnu
-          components: rustfmt, clippy
 
       - name: Pasang Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -57,34 +51,33 @@ jobs:
           python-version: ${{ matrix.python-version }}
           architecture: x64
 
-      - name: Pasang Maturin
-        timeout-minutes: 10
+      # 4. Instal Maturin & Delvewheel (untuk injeksi DLL)
+      - name: Pasang Tools Build & Bundling
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install maturin
+          pip install maturin delvewheel
 
-      - name: ⚙️ Kompilasi FFmpeg Statis + Modul
-        timeout-minutes: 60
-        shell: msys2 {0}
-        env:
-          FFMPEG_SYS_NEXT_NO_VCPKG: "1"
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-          # 1. Netralkan CFLAGS agar tidak memicu error arsitektur CPU di VM
-          CFLAGS: "-O2"
-          CXXFLAGS: "-O2"
-          # 2. Paksa path temporary ke format POSIX agar bash configure tidak error
-          TMPDIR: "/tmp"
-          TEMP: "/tmp"
-          TMP: "/tmp"
-        run: maturin build --release --out dist
-
-      # 3. 🚨 DITAMBAHKAN: Auto-Print config.log kalau maturin masih gagal
-      - name: 🚨 Debug Log FFmpeg (Jika Gagal)
-        if: failure()
-        shell: msys2 {0}
+      # 5. Modifikasi Cargo.toml secara dinamis agar tidak kompilasi ulang FFmpeg
+      - name: ⚙️ Sesuaikan Cargo.toml (Khusus Windows)
+        shell: bash
         run: |
-          echo "==== MENCARI DAN MENCETAK CONFIG.LOG ===="
-          find target -name "config.log" -exec cat {} \;
+          # Menghapus paksa tag "build" dan "static" menggunakan sed
+          sed -i 's/"build",//g' Cargo.toml
+          sed -i 's/"static",//g' Cargo.toml
+
+      # 6. Kompilasi Modul (Otomatis mendeteksi FFmpeg dari MSYS2 via pkg-config)
+      - name: ⚙️ Kompilasi Modul Python
+        timeout-minutes: 20
+        run: maturin build --release --out dist_tmp
+
+      # 7. Membungkus DLL yang dibutuhkan langsung ke dalam Wheel
+      - name: 📦 Inject DLL ke dalam Wheel (Delvewheel)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Get-ChildItem dist_tmp/*.whl | ForEach-Object {
+              delvewheel repair $_.FullName -w dist/
+          }
 
       - name: 📋 Hasil
         run: dir dist/
