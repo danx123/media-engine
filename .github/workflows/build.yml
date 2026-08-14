@@ -44,7 +44,8 @@ jobs:
           echo "Mengekstrak file..."
           7z x ffmpeg.7z -oC:\ffmpeg_build
           $folder = Get-ChildItem C:\ffmpeg_build -Directory | Select-Object -First 1
-          Rename-Item $folder.FullName C:\ffmpeg
+          # ⚙️ UBAH: Gunakan Move-Item alih-alih Rename-Item
+          Move-Item -Path $folder.FullName -Destination C:\ffmpeg
           echo "Berhasil! Direktori FFmpeg siap di C:\ffmpeg"
 
       # 3. Otomatis membersihkan Cargo.toml dari mode kompilasi source
