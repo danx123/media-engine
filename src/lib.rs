@@ -43,8 +43,13 @@ impl MediaInfo {
             .best(ffmpeg_next::media::Type::Video)
             .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Tidak ada aliran video"))?;
 
-        let codec_id = stream.parameters().id().name().to_string();
-        let codec = stream.parameters().id().description().unwrap_or("Tidak diketahui").to_string();
+        let id = stream.parameters().id();
+        let codec_id = id.name().to_string();
+        // Id tidak punya .description() lagi di ffmpeg-next 7.x — harus cari
+        // Codec-nya dulu lewat decoder::find() (Option, bukan Result).
+        let codec = ffmpeg_next::codec::decoder::find(id)
+            .map(|c| c.description().to_string())
+            .unwrap_or_else(|| "Tidak diketahui".to_string());
 
         let fps = stream.avg_frame_rate();
         let fps = if fps.denominator() > 0 {
@@ -54,12 +59,13 @@ impl MediaInfo {
         let duration = stream.duration() as f64 * f64::from(stream.time_base());
         let bitrate = input.bit_rate() as i64;
 
-        let decoder = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
 
-        let (width, height) = if let Some(vdec) = decoder.decoder().video() {
-            (vdec.width(), vdec.height())
-        } else { (0, 0) };
+        let (width, height) = match ctx.decoder().video() {
+            Ok(vdec) => (vdec.width(), vdec.height()),
+            Err(_) => (0, 0),
+        };
 
         Ok(MediaInfo {
             path: file_path.to_string(),
@@ -85,11 +91,16 @@ impl MediaInfo {
 // BAGIAN 2: DEKODER BINGKAI VIDEO
 // ═══════════════════════════════════════════════
 
-#[pyclass]
+// unsendable: SwsContext (dipakai lewat scaler cache) berisi raw pointer
+// (*mut SwsContext) yang gak implement Send. Karena PyO3 pyclass secara
+// default butuh Send, VideoDecoder harus ditandai unsendable — artinya
+// instance-nya cuma boleh diakses dari thread Python tempat dia dibikin
+// (biasanya main thread), gak bisa dipindah-pindah antar thread.
+#[pyclass(unsendable)]
 struct VideoDecoder {
     input_ctx: ffmpeg_next::format::context::Input,
     stream_idx: usize,
-    decoder: ffmpeg_next::codec::context::decoder::Video,
+    decoder: ffmpeg_next::decoder::Video,
     // 🧠 Cache konteks scaling — dibuat sekali, dipakai ulang tiap seek_frame()
     scaler: Option<ffmpeg_next::software::scaling::Context>,
     time_base: f64,
@@ -109,10 +120,12 @@ impl VideoDecoder {
         let mut input_ctx = ffmpeg_next::format::input(&path)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
 
-        let (stream_idx, stream) = input_ctx.streams()
+        // streams().best() balikin Stream langsung (bukan tuple), index-nya
+        // diambil lewat .index() setelahnya.
+        let stream = input_ctx.streams()
             .best(ffmpeg_next::media::Type::Video)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Tidak ada aliran video"))?
-            .into();
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Tidak ada aliran video"))?;
+        let stream_idx = stream.index();
 
         let tb = stream.time_base();
         let time_base = if tb.denominator() > 0 {
@@ -125,15 +138,13 @@ impl VideoDecoder {
         let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
 
-        let mut decoder = ctx.decoder().video()
+        // Catatan: dulu ada override manual buat pilih dekoder VP9 lewat
+        // decoder.set_codec(), tapi method itu udah gak ada di API 7.x.
+        // Gak masalah — ctx.decoder().video() otomatis pakai codec yang
+        // bener berdasarkan codecpar dari stream, jadi override manual
+        // ini emang udah gak perlu lagi.
+        let decoder = ctx.decoder().video()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Buat dekoder: {}", e)))?;
-
-        // 🔑 Otomatis pilih dekoder VP9 jika perlu
-        if codec == "vp9" {
-            if let Ok(vp9_decoder) = ffmpeg_next::codec::decoder::find(ffmpeg_next::codec::Id::VP9) {
-                decoder.set_codec(vp9_decoder);
-            }
-        }
 
         let (width, height) = (decoder.width(), decoder.height());
 
@@ -163,39 +174,39 @@ impl VideoDecoder {
         // Buang state dekoder lama (penting setelah seek, biar gak nyampur GOP lama)
         self.decoder.flush();
 
-        let mut pkt = ffmpeg_next::packet::Packet::empty();
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut packet_count = 0;
         let max_try = 200;
         let mut got_frame = false;
 
-        'read_loop: loop {
+        // Input gak punya method .read() langsung — cara baca paket di API
+        // 7.x adalah lewat iterator .packets(), yang menghasilkan pasangan
+        // (Stream, Packet). Index stream diambil dari situ, bukan dari
+        // Packet.stream_index() (yang juga udah gak ada).
+        // Ini adalah &mut borrow ke field input_ctx saja (bukan seluruh
+        // self), jadi self.decoder masih bisa diakses lepas di dalam loop.
+        'read_loop: for (stream, packet) in self.input_ctx.packets() {
             if packet_count > max_try {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err("Bingkai tidak ditemukan"));
             }
 
-            match self.input_ctx.read(&mut pkt) {
-                Ok(_) => {
-                    if pkt.stream_index() != self.stream_idx {
-                        packet_count += 1;
-                        continue;
-                    }
-
-                    self.decoder.send_packet(&pkt)
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Kirim paket gagal: {}", e)))?;
-
-                    // Satu paket bisa hasilkan >1 bingkai; ambil yang terakhir
-                    // yang tersedia sebelum lanjut baca paket berikutnya.
-                    while self.decoder.receive_frame(&mut decoded).is_ok() {
-                        got_frame = true;
-                        if decoded.timestamp().unwrap_or(0) >= target_ts {
-                            break 'read_loop;
-                        }
-                    }
-                }
-                Err(ffmpeg_next::Error::Eof) => break,
-                Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Baca gagal: {}", e))),
+            if stream.index() != self.stream_idx {
+                packet_count += 1;
+                continue;
             }
+
+            self.decoder.send_packet(&packet)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Kirim paket gagal: {}", e)))?;
+
+            // Satu paket bisa hasilkan >1 bingkai; ambil yang terakhir
+            // yang tersedia sebelum lanjut baca paket berikutnya.
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                got_frame = true;
+                if decoded.timestamp().unwrap_or(0) >= target_ts {
+                    break 'read_loop;
+                }
+            }
+
             packet_count += 1;
         }
 
