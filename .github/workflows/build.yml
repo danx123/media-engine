@@ -1,0 +1,45 @@
+name: Build Media Engine
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows Python 3.10–3.14
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pasang Rust + MSVC
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Pasang Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Pasang Maturin
+        run: pip install maturin
+
+      - name: ⚙️ Kompilasi FFmpeg Statis + Modul
+        env:
+          FFMPEG_SYS_NEXT_NO_VCPKG: "1"
+          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
+        run: maturin build --release --out dist
+
+      - name: 📋 Hasil
+        run: dir dist/
+
+      - name: 📤 Unggah Artefak
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-engine-py${{ matrix.python-version }}-windows
+          path: dist/*.whl
