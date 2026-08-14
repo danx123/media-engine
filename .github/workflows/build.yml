@@ -74,7 +74,10 @@ jobs:
             --enable-swresample \
             --enable-swscale \
             --enable-pthreads \
-            --disable-w32threads
+            --disable-w32threads \
+            --disable-dxva2 \
+            --disable-d3d11va \
+            --disable-mediafoundation
 
           make -j"$(nproc)"
           make install
