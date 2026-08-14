@@ -90,6 +90,8 @@ struct VideoDecoder {
     input_ctx: ffmpeg_next::format::context::Input,
     stream_idx: usize,
     decoder: ffmpeg_next::codec::context::decoder::Video,
+    // 🧠 Cache konteks scaling — dibuat sekali, dipakai ulang tiap seek_frame()
+    scaler: Option<ffmpeg_next::software::scaling::Context>,
     time_base: f64,
     #[pyo3(get)] duration: f64,
     #[pyo3(get)] width: u32,
@@ -139,6 +141,7 @@ impl VideoDecoder {
             input_ctx,
             stream_idx,
             decoder,
+            scaler: None,
             time_base,
             duration,
             width,
@@ -151,64 +154,91 @@ impl VideoDecoder {
     fn seek_frame(&mut self, second: f64) -> PyResult<Py<PyArray3<u8>>> {
         let target_ts = (second / self.time_base).round() as i64;
 
-        self.input_ctx.seek(target_ts..target_ts + 10)
+        // Lompat ke belakang sedikit supaya nemu keyframe terdekat sebelum target,
+        // lalu baca maju sampai lewati target_ts.
+        self.input_ctx
+            .seek(target_ts, ..target_ts)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Lompat gagal: {}", e)))?;
 
-        let mut pkt = ffmpeg_next::packet::Packet::empty();
-        let mut frame_count = 0;
-        let max_try = 50;
+        // Buang state dekoder lama (penting setelah seek, biar gak nyampur GOP lama)
+        self.decoder.flush();
 
-        loop {
-            if frame_count > max_try {
+        let mut pkt = ffmpeg_next::packet::Packet::empty();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut packet_count = 0;
+        let max_try = 200;
+        let mut got_frame = false;
+
+        'read_loop: loop {
+            if packet_count > max_try {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err("Bingkai tidak ditemukan"));
             }
 
             match self.input_ctx.read(&mut pkt) {
                 Ok(_) => {
                     if pkt.stream_index() != self.stream_idx {
-                        frame_count += 1;
+                        packet_count += 1;
                         continue;
                     }
 
-                    pkt.decode(&mut self.decoder)
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Dekode gagal: {}", e)))?;
+                    self.decoder.send_packet(&pkt)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Kirim paket gagal: {}", e)))?;
 
-                    if let Ok(frame) = self.decoder.frame() {
-                        // Konversi ke RGB24
-                        let mut converter = ffmpeg_next::software::scaling::Context::get(
-                            ffmpeg_next::util::format::Pixel::RGB24,
-                            self.width,
-                            self.height,
-                            ffmpeg_next::util::format::Pixel::RGB24,
-                        );
-
-                        let mut rgb_frame = ffmpeg_next::frame::Video::new(
-                            ffmpeg_next::util::format::Pixel::RGB24,
-                            self.width,
-                            self.height,
-                        );
-
-                        converter.run(&frame, &mut rgb_frame)
-                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Konversi warna gagal: {}", e)))?;
-
-                        let data = rgb_frame.data(0).to_vec();
-                        let arr = Array3::from_shape_vec(
-                            (self.height as usize, self.width as usize, 3),
-                            data,
-                        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Array gagal: {}", e)))?;
-
-                        return Python::with_gil(|py| {
-                            Ok(arr.into_pyarray_bound(py).into())
-                        });
+                    // Satu paket bisa hasilkan >1 bingkai; ambil yang terakhir
+                    // yang tersedia sebelum lanjut baca paket berikutnya.
+                    while self.decoder.receive_frame(&mut decoded).is_ok() {
+                        got_frame = true;
+                        if decoded.timestamp().unwrap_or(0) >= target_ts {
+                            break 'read_loop;
+                        }
                     }
                 }
                 Err(ffmpeg_next::Error::Eof) => break,
                 Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("Baca gagal: {}", e))),
             }
-            frame_count += 1;
+            packet_count += 1;
         }
 
-        Err(pyo3::exceptions::PyRuntimeError::new_err("Tidak dapat membaca bingkai"))
+        if !got_frame {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Tidak dapat membaca bingkai"));
+        }
+
+        // Bikin konteks scaling sekali saja lalu di-cache; dipakai ulang tiap panggilan.
+        let width = self.width;
+        let height = self.height;
+        let src_format = self.decoder.format();
+        let scaler = match &mut self.scaler {
+            Some(s) => s,
+            None => {
+                let ctx = ffmpeg_next::software::scaling::Context::get(
+                    src_format,
+                    width,
+                    height,
+                    ffmpeg_next::util::format::Pixel::RGB24,
+                    width,
+                    height,
+                    ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Buat konteks scaling: {}", e)))?;
+                self.scaler.insert(ctx)
+            }
+        };
+
+        let mut rgb_frame = ffmpeg_next::frame::Video::new(
+            ffmpeg_next::util::format::Pixel::RGB24,
+            width,
+            height,
+        );
+
+        scaler.run(&decoded, &mut rgb_frame)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Konversi warna gagal: {}", e)))?;
+
+        let data = rgb_frame.data(0).to_vec();
+        let arr = Array3::from_shape_vec(
+            (height as usize, width as usize, 3),
+            data,
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Array gagal: {}", e)))?;
+
+        Python::with_gil(|py| Ok(arr.into_pyarray_bound(py).into()))
     }
 }
 
