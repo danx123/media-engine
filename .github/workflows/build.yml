@@ -17,33 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Pasang Lingkungan MSYS2 beserta FFmpeg Pre-built
-      - name: Pasang MSYS2 + FFmpeg Pre-built
-        id: msys2
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          path-type: inherit
-          install: >-
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-ffmpeg
-
-      # 2. Daftarkan path compiler dan library MSYS2 agar terdeteksi
-      - name: Setup Environment (PATH)
-        shell: pwsh
-        env:
-          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
-        run: |
-          echo "$env:MSYS2_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "$env:MSYS2_LOCATION\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      # 3. Sinkronisasi compiler Rust ke lingkungan GNU
-      - name: Pasang Rust (GNU)
+      # 1. Gunakan Toolchain murni Windows (MSVC) untuk kompatibilitas 100% dengan CPython
+      - name: Pasang Rust (MSVC Host)
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-gnu
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
 
       - name: Pasang Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -51,38 +30,56 @@ jobs:
           python-version: ${{ matrix.python-version }}
           architecture: x64
 
-      # 4. Instal Maturin & Delvewheel (untuk injeksi DLL)
-      - name: Pasang Tools Build & Bundling
+      - name: Pasang Maturin & Delvewheel
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install maturin delvewheel
 
-      # 5. Modifikasi Cargo.toml secara dinamis agar tidak kompilasi ulang FFmpeg
-      - name: ⚙️ Sesuaikan Cargo.toml (Khusus Windows)
-        shell: bash
+      # 2. Unduh FFmpeg siap pakai (berisi Header .h, Library .lib, dan Binary .dll MSVC-compatible)
+      - name: 📥 Unduh FFmpeg Prebuilt (Gyan.dev)
+        shell: pwsh
         run: |
-          # Menghapus paksa tag "build" dan "static" menggunakan sed
-          sed -i 's/"build",//g' Cargo.toml
-          sed -i 's/"static",//g' Cargo.toml
+          echo "Mengunduh FFmpeg Shared..."
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile "ffmpeg.7z"
+          echo "Mengekstrak file..."
+          7z x ffmpeg.7z -oC:\ffmpeg_build
+          $folder = Get-ChildItem C:\ffmpeg_build -Directory | Select-Object -First 1
+          Rename-Item $folder.FullName C:\ffmpeg
+          echo "Berhasil! Direktori FFmpeg siap di C:\ffmpeg"
 
-      # 6. Kompilasi Modul (Otomatis mendeteksi FFmpeg dari MSYS2 via pkg-config)
-      - name: ⚙️ Kompilasi Modul Python
-        timeout-minutes: 20
+      # 3. Otomatis membersihkan Cargo.toml dari mode kompilasi source
+      - name: ⚙️ Sesuaikan Cargo.toml (Hapus fitur Build/Static)
+        shell: python
+        run: |
+          import re
+          with open('Cargo.toml', 'r', encoding='utf-8') as f:
+              data = f.read()
+          # Menghapus paksa "build" dan "static" agar beralih ke mode Dynamic Link
+          data = re.sub(r'"static"\s*,?\s*', '', data)
+          data = re.sub(r'"build"\s*,?\s*', '', data)
+          with open('Cargo.toml', 'w', encoding='utf-8') as f:
+              f.write(data)
+
+      # 4. Bindgen & Cargo akan otomatis mengambil header/lib dari FFMPEG_DIR
+      - name: ⚙️ Kompilasi Modul Python (Maturin)
+        env:
+          FFMPEG_DIR: "C:\\ffmpeg"
         run: maturin build --release --out dist_tmp
 
-      # 7. Membungkus DLL yang dibutuhkan langsung ke dalam Wheel
-      - name: 📦 Inject DLL ke dalam Wheel (Delvewheel)
+      # 5. Delvewheel akan menyedot avcodec.dll dkk dari C:\ffmpeg\bin ke dalam Wheel
+      - name: 📦 Bundle DLL ke dalam Wheel (Delvewheel)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist
+          $env:PATH += ";C:\ffmpeg\bin"
           Get-ChildItem dist_tmp/*.whl | ForEach-Object {
-              delvewheel repair $_.FullName -w dist/
+              delvewheel repair $_.FullName -w dist/ --add-path C:\ffmpeg\bin
           }
 
-      - name: 📋 Hasil
+      - name: 📋 Hasil Akhir
         run: dir dist/
 
-      - name: 📤 Unggah Artefak
+      - name: 📤 Unggah Artefak Python Wheel
         uses: actions/upload-artifact@v4
         with:
           name: media-engine-py${{ matrix.python-version }}-windows
