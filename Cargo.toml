@@ -8,15 +8,14 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 numpy = "0.22"
 ndarray = "0.15"
 
-# ✅ FFmpeg: nyalakan fitur yang dibutuhkan SAJA, tetap statis
 ffmpeg-next = { version = "7.0", features = [
-    "static",   # ← Dikompilasi statis
-    "build",    # ← Bangun dari sumber
-    "codec",    # ← Dekoder/enkoder (WAJIB!)
-    "format",   # ← Baca format file (WAJIB!)
-    "resample", # ← Konversi sampel
-    "scale"     # ← Ubah ukuran/pixel
-], default-features = true }
+    "static",
+    "build",
+    "codec",
+    "format",
+    "resampling",
+    "scaling"
+] }
 
 [profile.release]
 opt-level = 3
