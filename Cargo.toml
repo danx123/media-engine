@@ -8,9 +8,28 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310", "genera
 numpy = "0.22"
 ndarray = "0.15"
 
-ffmpeg-next = { version = "7.0", features = [
+# Non-Windows (mis. lint/test lokal di Linux/macOS): ffmpeg-sys-next boleh
+# pakai feature "build"-nya sendiri buat compile FFmpeg dari source, karena
+# di situ TARGET == HOST jadi gak kena bug cross-compile target_os di bawah.
+[target.'cfg(not(windows))'.dependencies]
+ffmpeg-next = { version = "7.0", default-features = false, features = [
     "static",
     "build",
+    "codec",
+    "format",
+    "software-resampling",
+    "software-scaling"
+] }
+
+# Windows (native ATAU cross-compile dari Linux): TIDAK pakai feature "build".
+# ffmpeg-sys-next versi 7.x salah kirim --target_os=windows ke `configure`
+# FFmpeg pas cross-compile (harusnya mingw32/mingw64), jadi configure-nya
+# selalu gagal dengan "Unknown OS 'windows'". Solusinya: FFmpeg dikompilasi
+# manual di CI (lihat build.yml) dengan --target-os=mingw32 yang benar, lalu
+# ffmpeg-sys-next diarahkan ke situ lewat env var FFMPEG_DIR.
+[target.'cfg(windows)'.dependencies]
+ffmpeg-next = { version = "7.0", default-features = false, features = [
+    "static",
     "codec",
     "format",
     "software-resampling",
