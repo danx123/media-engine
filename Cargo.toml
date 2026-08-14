@@ -13,8 +13,8 @@ ffmpeg-next = { version = "7.0", features = [
     "build",
     "codec",
     "format",
-    "resampling",
-    "scaling"
+    "software-resampling",
+    "software-scaling"
 ] }
 
 [profile.release]
