@@ -6,82 +6,78 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    name: Windows Python ${{ matrix.python-version }}
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+  cross-build-windows:
+    name: Cross-compile Windows wheel (abi3)
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Gunakan Toolchain murni Windows (MSVC) untuk kompatibilitas 100% dengan CPython
-      - name: Pasang Rust (MSVC Host)
+      # 🧱 mingw-w64 = compiler + linker buat target Windows.
+      # Paket -posix WAJIB dipilih (bukan -win32) karena FFmpeg butuh pthreads,
+      # dan varian -win32 mingw-w64 default di Ubuntu gak punya itu.
+      - name: Pasang toolchain cross mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-mingw-w64-x86-64 \
+            g++-mingw-w64-x86-64 \
+            binutils-mingw-w64-x86-64 \
+            nasm \
+            yasm \
+            pkg-config \
+            make \
+            diffutils \
+            autoconf \
+            automake \
+            libtool \
+            patch
+
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Pasang Rust + target windows-gnu
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable-x86_64-pc-windows-msvc
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
 
-      - name: Pasang Python ${{ matrix.python-version }}
+      - name: Pasang Python (host, buat jalanin maturin)
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          architecture: x64
+          python-version: "3.12"
 
-      - name: Pasang Maturin & Delvewheel
+      - name: Pasang Maturin
+        timeout-minutes: 10
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install maturin delvewheel
+          pip install maturin
 
-      # 2. Unduh FFmpeg siap pakai (berisi Header .h, Library .lib, dan Binary .dll MSVC-compatible)
-      - name: 📥 Unduh FFmpeg Prebuilt (Gyan.dev)
-        shell: pwsh
+      # 🔧 Cargo perlu tau linker mana yang dipakai buat target windows-gnu.
+      - name: Setup linker cargo buat target windows-gnu
         run: |
-          echo "Mengunduh FFmpeg Shared..."
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z" -OutFile "ffmpeg.7z"
-          echo "Mengekstrak file..."
-          7z x ffmpeg.7z -oC:\ffmpeg_build
-          $folder = Get-ChildItem C:\ffmpeg_build -Directory | Select-Object -First 1
-          # ⚙️ UBAH: Gunakan Move-Item alih-alih Rename-Item
-          Move-Item -Path $folder.FullName -Destination C:\ffmpeg
-          echo "Berhasil! Direktori FFmpeg siap di C:\ffmpeg"
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+          ar = "x86_64-w64-mingw32-ar"
+          EOF
 
-      # 3. Otomatis membersihkan Cargo.toml dari mode kompilasi source
-      - name: ⚙️ Sesuaikan Cargo.toml (Hapus fitur Build/Static)
-        shell: python
-        run: |
-          import re
-          with open('Cargo.toml', 'r', encoding='utf-8') as f:
-              data = f.read()
-          # Menghapus paksa "build" dan "static" agar beralih ke mode Dynamic Link
-          data = re.sub(r'"static"\s*,?\s*', '', data)
-          data = re.sub(r'"build"\s*,?\s*', '', data)
-          with open('Cargo.toml', 'w', encoding='utf-8') as f:
-              f.write(data)
-
-      # 4. Bindgen & Cargo akan otomatis mengambil header/lib dari FFMPEG_DIR
-      - name: ⚙️ Kompilasi Modul Python (Maturin)
+      # ⚙️ ffmpeg-sys-next otomatis mendeteksi cross-compile (TARGET != HOST)
+      # dan menyusun --cross-prefix/--arch/--target-os sendiri dari compiler
+      # x86_64-w64-mingw32-gcc yang barusan dipasang, jadi gak perlu diset manual.
+      - name: ⚙️ Kompilasi FFmpeg Statis + Modul (cross ke Windows)
+        timeout-minutes: 60
         env:
-          FFMPEG_DIR: "C:\\ffmpeg"
-        run: maturin build --release --out dist_tmp
+          FFMPEG_SYS_NEXT_NO_VCPKG: "1"
+          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
+        run: maturin build --release --target x86_64-pc-windows-gnu --out dist
 
-      # 5. Delvewheel akan menyedot avcodec.dll dkk dari C:\ffmpeg\bin ke dalam Wheel
-      - name: 📦 Bundle DLL ke dalam Wheel (Delvewheel)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          $env:PATH += ";C:\ffmpeg\bin"
-          Get-ChildItem dist_tmp/*.whl | ForEach-Object {
-              delvewheel repair $_.FullName -w dist/ --add-path C:\ffmpeg\bin
-          }
+      - name: 📋 Hasil
+        run: ls -la dist/
 
-      - name: 📋 Hasil Akhir
-        run: dir dist/
-
-      - name: 📤 Unggah Artefak Python Wheel
+      - name: 📤 Unggah Artefak
         uses: actions/upload-artifact@v4
         with:
-          name: media-engine-py${{ matrix.python-version }}-windows
+          name: media-engine-windows-abi3
           path: dist/*.whl
