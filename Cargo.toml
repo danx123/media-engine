@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = { version = "0.22", features = ["ndarray"] }
+numpy = "0.22"
 ndarray = "0.15"
 ffmpeg-next = { version = "7.0", features = ["static", "build"], default-features = false }
 
