@@ -71,7 +71,16 @@ jobs:
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-        run: maturin build --release --target x86_64-pc-windows-gnu --out dist
+        run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
+
+      # 🩺 Pesan "configure failed" dari ffmpeg-sys-next itu generic — alasan
+      # aslinya (baris "ERROR: ..." dari script configure FFmpeg) ada di
+      # config.log ini. Kalau build gagal lagi, cek output step ini.
+      - name: 🩺 Dump config.log FFmpeg kalau configure gagal
+        if: failure()
+        run: |
+          echo "Mencari config.log FFmpeg di dalam target/..."
+          find target -iname 'config.log' -exec sh -c 'echo "==== {} ===="; tail -n 200 "{}"' \;
 
       - name: 📋 Hasil
         run: ls -la dist/
