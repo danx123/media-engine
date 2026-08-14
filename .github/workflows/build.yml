@@ -7,9 +7,10 @@ on:
 
 jobs:
   build-windows:
-    name: Windows Python 3.10–3.14
+    name: Windows Python ${{ matrix.python-version }}
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
 
@@ -27,9 +28,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Pasang Maturin
-        run: pip install maturin
+        timeout-minutes: 10
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install maturin
 
       - name: ⚙️ Kompilasi FFmpeg Statis + Modul
+        timeout-minutes: 45
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
           FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
