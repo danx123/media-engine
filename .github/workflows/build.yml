@@ -9,6 +9,18 @@ jobs:
   cross-build-windows:
     name: Cross-compile Windows wheel (abi3)
     runs-on: ubuntu-latest
+    env:
+      # [FIX] Samakan minor version FFmpeg dengan `ffmpeg-next = "7.0"` di
+      # Cargo.toml. ffmpeg-next punya banyak `match` Rust manual (pixel
+      # format, codec ID, dll) yang di-generate/di-maintain untuk rentang
+      # versi tertentu -- kalau FFmpeg yang dikompilasi lebih baru (mis.
+      # n7.1) dan menambah varian enum baru, bindgen ikut memasukkannya ke
+      # bindings.rs, tapi match statement di ffmpeg-next belum kenal varian
+      # itu -> compile error E0004 "non-exhaustive patterns". Kalau nanti
+      # mau naik ke FFmpeg 7.1, naikkan juga `ffmpeg-next` (dan
+      # `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support 7.1
+      # secara eksplisit, jangan cuma ganti tag ini sendirian.
+      FFMPEG_TAG: n7.0
 
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +54,20 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-gnu
 
+      # 💾 [BARU] Cache hasil build statis FFmpeg antar-run. Compile FULL
+      # FFmpeg dari nol (semua codec/format aktif, gak dibatasi
+      # --disable-everything) di runner 2 core kadang mepet/lewat batas
+      # timeout 40 menit -- ini salah satu penyebab build "kadang gagal
+      # kadang enggak" tanpa error yang konsisten. Key cache ikut FFMPEG_TAG
+      # + isi konfigurasi cross-compile (lewat hash file ini sendiri), jadi
+      # otomatis invalidate kalau tag/flag configure di atas diubah.
+      - name: 💾 Cache FFmpeg hasil cross-compile
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-windows
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-${{ hashFiles('.github/workflows/build.yml') }}
+
       # 🎬 ffmpeg-sys-next 7.x salah kirim --target_os=windows ke `configure`
       # FFmpeg pas dia yang nge-drive proses cross-compile ("Unknown OS
       # 'windows'"). Makanya FFmpeg dikompilasi manual di sini dengan
@@ -49,9 +75,8 @@ jobs:
       # ke hasilnya lewat FFMPEG_DIR (lihat Cargo.toml: feature "build" udah
       # dimatiin khusus buat target Windows).
       - name: 🎬 Kompilasi FFmpeg statis (cross ke Windows, target-os=mingw32)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         timeout-minutes: 40
-        env:
-          FFMPEG_TAG: n7.1
         run: |
           git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
@@ -82,7 +107,12 @@ jobs:
           make -j"$(nproc)"
           make install
 
-          echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
+      # [BARU] Selalu set FFMPEG_DIR di sini (bukan di dalam step compile),
+      # supaya tetap ke-set dengan benar walau step compile di atas di-skip
+      # karena cache-hit -- sebelumnya env ini cuma di-export kalau step
+      # compile benar-benar jalan.
+      - name: Set FFMPEG_DIR
+        run: echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
 
       - name: Pasang Python (host, buat jalanin maturin)
         uses: actions/setup-python@v5
