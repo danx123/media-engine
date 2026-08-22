@@ -150,8 +150,7 @@ jobs:
         timeout-minutes: 30
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
-	  
+          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"	  
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
       # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
