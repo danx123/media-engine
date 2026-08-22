@@ -117,7 +117,7 @@ impl VideoDecoder {
         init_ffmpeg()?;
 
         let path = Path::new(file_path);
-        let mut input_ctx = ffmpeg_next::format::input(&path)
+        let input_ctx = ffmpeg_next::format::input(&path)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("Buka file: {}", e)))?;
 
         // streams().best() balikin Stream langsung (bukan tuple), index-nya
@@ -162,7 +162,7 @@ impl VideoDecoder {
     }
 
     /// Lompat ke detik tertentu → kembalikan bingkai RGB sebagai np.array [H, W, 3]
-    fn seek_frame(&mut self, second: f64) -> PyResult<Py<PyArray3<u8>>> {
+    fn seek_frame(&mut self, py: Python<'_>, second: f64) -> PyResult<Py<PyArray3<u8>>> {
         let target_ts = (second / self.time_base).round() as i64;
 
         // Lompat ke belakang sedikit supaya nemu keyframe terdekat sebelum target,
@@ -249,7 +249,7 @@ impl VideoDecoder {
             data,
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Array gagal: {}", e)))?;
 
-        Python::with_gil(|py| Ok(arr.into_pyarray_bound(py).into()))
+        Ok(arr.into_pyarray(py).into())
     }
 }
 
