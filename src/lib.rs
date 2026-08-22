@@ -243,7 +243,19 @@ impl VideoDecoder {
         scaler.run(&decoded, &mut rgb_frame)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Konversi warna gagal: {}", e)))?;
 
-        let data = rgb_frame.data(0).to_vec();
+        let stride = rgb_frame.stride(0); // Ambil panjang baris asli beserta padding-nya
+        let row_width = (width as usize) * 3; // Lebar memori murni yang kita butuhkan
+        let mut data = Vec::with_capacity((height as usize) * row_width);
+        
+        let raw_data = rgb_frame.data(0);
+        
+        // Looping per baris untuk membuang padding memori FFmpeg
+        for y in 0..(height as usize) {
+            let start = y * stride;
+            let end = start + row_width;
+            data.extend_from_slice(&raw_data[start..end]);
+        }
+
         let arr = Array3::from_shape_vec(
             (height as usize, width as usize, 3),
             data,
