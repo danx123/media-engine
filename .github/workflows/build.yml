@@ -53,6 +53,37 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-gnu
+          
+      - name: Pasang Meson & Ninja (buat libdav1d)
+        run: pip install meson ninja
+        
+      - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://code.videolan.org/videolan/dav1d.git dav1d-src
+          cd dav1d-src
+          
+          # Bikin file konfigurasi cross-compile buat Meson
+          cat <<EOF > cross_file.txt
+          [binaries]
+          c = 'x86_64-w64-mingw32-gcc-posix'
+          cpp = 'x86_64-w64-mingw32-g++-posix'
+          ar = 'x86_64-w64-mingw32-ar'
+          strip = 'x86_64-w64-mingw32-strip'
+          pkgconfig = 'pkg-config'
+          windres = 'x86_64-w64-mingw32-windres'
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+          
+          # Setup build statis dan install ke folder prefix yang sama kayak FFmpeg
+          meson setup build --cross-file cross_file.txt --default-library static --prefix="$HOME/ffmpeg-windows" --libdir="lib"
+          ninja -C build
+          ninja -C build install
 
       # 💾 [BARU] Cache hasil build statis FFmpeg antar-run. Compile FULL
       # FFmpeg dari nol (semua codec/format aktif, gak dibatasi
@@ -91,18 +122,20 @@ jobs:
             --disable-shared \
             --disable-programs \
             --disable-doc \
-            --disable-avdevice \
-            --disable-avfilter \
-            --disable-postproc \
+            --enable-avdevice \
+            --enable-avfilter \
+            --enable-postproc \
             --enable-avcodec \
             --enable-avformat \
             --enable-swresample \
             --enable-swscale \
             --enable-pthreads \
-            --disable-w32threads \
-            --disable-dxva2 \
-            --disable-d3d11va \
-            --disable-mediafoundation
+            --enable-w32threads \
+            --enable-dxva2 \
+            --enable-d3d11va \
+            --enable-mediafoundation
+            --enable-libdav1d
+            --pkg-config="pkg-config --static"
 
           make -j"$(nproc)"
           make install
