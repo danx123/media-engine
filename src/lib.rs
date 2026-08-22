@@ -516,11 +516,18 @@ impl PlayerEngine {
         if let Some(stream) = self._audio_stream.as_ref() {
             let _ = stream.pause();
         }
-        // Simpen posisi sekarang sbg base baru biar gak lompat pas resume.
-        // Dipanggil SETELAH stream di-pause biar audio_frames_played udah
-        // gak nambah lagi pas dibaca di sini.
+        // PENTING: pakai reset_clock() (bukan cuma nulis clock_base_pts
+        // manual) karena reset_clock() JUGA nge-nolin audio_frames_played
+        // balik ke 0. Kalau frames_played dibiarin jalan terus dari angka
+        // lama sementara base udah "menyerap" nilai lama itu juga, position()
+        // = base + frames/sr bakal DOBEL-ngitung waktu yang sama tiap siklus
+        // pause->resume -- position() jadi jauh melenceng dari pts frame
+        // manapun di queue, semua frame video keanggep "telat" dan didrop
+        // terus-terusan (video macet total), sementara audio gak kena
+        // imbasnya sama sekali karena audio callback gak pernah baca
+        // position(), dia cuma narik dari buffernya sendiri.
         let pos = self.shared.position();
-        *self.shared.clock_base_pts.lock().unwrap() = pos;
+        self.shared.reset_clock(pos);
         self.shared.playing.store(false, Ordering::SeqCst);
     }
 
@@ -557,8 +564,6 @@ impl PlayerEngine {
         }
     }
 
-    /// Lompat ke detik tertentu. Non-blocking — decode thread yang
-    /// beneran ngerjain seek di background.
     /// Lompat ke detik tertentu. Kalau lagi playing, audio stream dipause
     /// sesaat sementara nunggu decode thread ngisi ulang buffer pasca-seek
     /// (yg otomatis dikosongin) -- kalau nggak, sama kayak masalah di
