@@ -842,12 +842,8 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
                 if d.send_packet(&packet).is_ok() {
                     while d.receive_frame(&mut vframe).is_ok() {
                         let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
-						// --- 🚀 OPTIMASI: EARLY FRAME DROPPING ---
-                        // Cek jam utama (master clock). Kalau bingkai ini sudah telat,
-                        // lewati konversi RGB yang berat agar thread bisa mengebut mengejar audio!
-                        let now = shared.position();
-                        if pts + LATE_FRAME_DROP_SEC < now {
-							continue;
+                        if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, d.format(), vwidth, vheight) {
+                            shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                         }
                     }
                 }
