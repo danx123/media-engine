@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
-numpy = "0.22"
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310", "generate-import-lib"] }
+numpy = "0.29"
 ndarray = "0.15"
 
 # Non-Windows (mis. lint/test lokal di Linux/macOS): ffmpeg-sys-next boleh
