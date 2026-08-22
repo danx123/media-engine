@@ -129,7 +129,7 @@ jobs:
             --enable-avformat \
             --enable-swresample \
             --enable-swscale \
-            --enable-pthreads \
+            --disable-pthreads \
             --enable-w32threads \
             --enable-dxva2 \
             --enable-d3d11va \
