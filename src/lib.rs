@@ -319,6 +319,7 @@ impl VideoDecoder {
         let arr = Array3::from_shape_vec((height as usize, width as usize, 3), data).unwrap();
         Ok(arr.into_pyarray(py).into())
     }
+}
 
 // ═══════════════════════════════════════════════
 // DAFTARKAN KE MODUL
