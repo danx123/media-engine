@@ -83,7 +83,21 @@ jobs:
           # Setup build statis dan install ke folder prefix yang sama kayak FFmpeg
           meson setup build --cross-file cross_file.txt --default-library static --prefix="$HOME/ffmpeg-windows" --libdir="lib"
           ninja -C build
-          ninja -C build install     
+          ninja -C build install
+
+      # 💾 [BARU] Cache hasil build statis FFmpeg antar-run. Compile FULL
+      # FFmpeg dari nol (semua codec/format aktif, gak dibatasi
+      # --disable-everything) di runner 2 core kadang mepet/lewat batas
+      # timeout 40 menit -- ini salah satu penyebab build "kadang gagal
+      # kadang enggak" tanpa error yang konsisten. Key cache ikut FFMPEG_TAG
+      # + isi konfigurasi cross-compile (lewat hash file ini sendiri), jadi
+      # otomatis invalidate kalau tag/flag configure di atas diubah.
+      - name: 💾 Cache FFmpeg hasil cross-compile
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-windows
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-${{ hashFiles('.github/workflows/build.yml') }}
 
       # 🎬 ffmpeg-sys-next 7.x salah kirim --target_os=windows ke `configure`
       # FFmpeg pas dia yang nge-drive proses cross-compile ("Unknown OS
@@ -91,7 +105,9 @@ jobs:
       # --target-os=mingw32 yang benar, lalu ffmpeg-sys-next tinggal diarahkan
       # ke hasilnya lewat FFMPEG_DIR (lihat Cargo.toml: feature "build" udah
       # dimatiin khusus buat target Windows).
-      - name: 🎬 Kompilasi FFmpeg statis (cross ke Windows, target-os=mingw32)        
+      - name: 🎬 Kompilasi FFmpeg statis (cross ke Windows, target-os=mingw32)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 40
         run: |
           git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
@@ -117,8 +133,8 @@ jobs:
             --enable-w32threads \
             --enable-dxva2 \
             --enable-d3d11va \
-            --enable-mediafoundation
-            --enable-libdav1d
+            --enable-mediafoundation \
+            --enable-libdav1d \
             --pkg-config="pkg-config --static"
 
           make -j"$(nproc)"
