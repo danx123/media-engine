@@ -3,7 +3,7 @@ use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use numpy::{IntoPyArray, PyArray3, ndarray::Array3};
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -274,6 +274,13 @@ struct Shared {
     out_channels: AtomicI64,
     has_audio: AtomicBool,
 
+    // f32 disimpen lewat to_bits()/from_bits() karena gak ada AtomicF32 di
+    // std. 1.0 = full volume, 0.0 = diam. muted dipisah dari volume biar
+    // toggle mute gak ngerusak nilai volume sebelumnya (bisa balik ke
+    // volume yg sama pas di-unmute).
+    volume_bits: AtomicU32,
+    muted: AtomicBool,
+
     seek_to: Mutex<Option<f64>>,
     playing: AtomicBool,
     stop: AtomicBool,
@@ -300,6 +307,16 @@ impl Shared {
                 }
                 _ => base,
             }
+        }
+    }
+
+    /// Volume yang beneran dipakai di audio callback: 0 kalau lagi muted,
+    /// selain itu ya volume_bits apa adanya.
+    fn effective_volume(&self) -> f32 {
+        if self.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
         }
     }
 
@@ -361,6 +378,8 @@ impl PlayerEngine {
             out_sample_rate: AtomicI64::new(48000),
             out_channels: AtomicI64::new(2),
             has_audio: AtomicBool::new(has_audio),
+            volume_bits: AtomicU32::new(1.0f32.to_bits()),
+            muted: AtomicBool::new(false),
             seek_to: Mutex::new(None),
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -393,11 +412,19 @@ impl PlayerEngine {
                             move |data: &mut [f32], _| {
                                 let mut buf = shared_cb.audio_buf.lock().unwrap();
                                 let ch = shared_cb.out_channels.load(Ordering::Relaxed).max(1) as usize;
+                                // Dibaca sekali per callback (bukan per-sample) biar gak ada
+                                // atomic load ribuan kali per buffer -- toh kuping gak bakal
+                                // notice volume berubah di tengah satu buffer (~ms doang).
+                                let vol = shared_cb.effective_volume();
                                 let mut i = 0;
                                 while i < data.len() {
-                                    data[i] = buf.pop_front().unwrap_or(0.0); // 0.0 = diam kalau buffer kosong (underrun)
+                                    // 0.0 = diam kalau buffer kosong (underrun)
+                                    data[i] = buf.pop_front().unwrap_or(0.0) * vol;
                                     i += 1;
                                 }
+                                // Frame count buat clock TETEP dihitung dari data yang
+                                // dikonsumsi apa adanya -- volume/mute gak boleh ganggu
+                                // sinkronisasi audio-video.
                                 shared_cb.audio_frames_played.fetch_add((data.len() / ch) as u64, Ordering::Relaxed);
                             },
                             |err| eprintln!("[media_engine] audio stream error: {err}"),
@@ -472,6 +499,25 @@ impl PlayerEngine {
     /// (atau wall-clock kalau video-only).
     fn position(&self) -> f64 {
         self.shared.position()
+    }
+
+    /// Atur volume 0.0 (diam) - 1.0 (full). Nilai di luar itu di-clamp,
+    /// jadi aman dipanggil langsung dari slider Qt tanpa validasi tambahan.
+    fn set_volume(&mut self, volume: f32) {
+        let v = volume.clamp(0.0, 1.0);
+        self.shared.volume_bits.store(v.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get_volume(&self) -> f32 {
+        f32::from_bits(self.shared.volume_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        self.shared.muted.store(muted, Ordering::Relaxed);
+    }
+
+    fn is_muted(&self) -> bool {
+        self.shared.muted.load(Ordering::Relaxed)
     }
 
     fn is_eof(&self) -> bool {
