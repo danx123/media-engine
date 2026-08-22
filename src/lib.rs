@@ -263,7 +263,7 @@ impl VideoDecoder {
 
         Ok(arr.into_pyarray(py).into())
     }
-}
+
 
 	/// Baca bingkai selanjutnya secara berurutan untuk playback yang mulus
     fn read_next_frame(&mut self, py: Python<'_>) -> PyResult<Py<PyArray3<u8>>> {
