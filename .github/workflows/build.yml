@@ -174,7 +174,8 @@ jobs:
               "-C", "link-arg=-luser32",
               "-C", "link-arg=-lsecur32",
               "-C", "link-arg=-lole32",
-              "-C", "link-arg=-lcrypt32"
+              "-C", "link-arg=-lcrypt32",
+              "-C", "link-arg=-ldav1d"
           ]
           EOF
 
