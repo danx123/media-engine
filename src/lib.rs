@@ -265,6 +265,61 @@ impl VideoDecoder {
     }
 }
 
+	/// Baca bingkai selanjutnya secara berurutan untuk playback yang mulus
+    fn read_next_frame(&mut self, py: Python<'_>) -> PyResult<Py<PyArray3<u8>>> {
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut got_frame = false;
+
+        // Tarik paket lanjutan tanpa memanggil .seek() atau membuang buffer
+        for (stream, packet) in self.input_ctx.packets() {
+            if stream.index() != self.stream_idx { continue; }
+
+            self.decoder.send_packet(&packet)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Kirim paket: {}", e)))?;
+
+            if self.decoder.receive_frame(&mut decoded).is_ok() {
+                got_frame = true;
+                break;
+            }
+        }
+
+        if !got_frame {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("Akhir video"));
+        }
+
+        // Siapkan scaler (cache jika belum ada)
+        let width = self.width;
+        let height = self.height;
+        let src_format = self.decoder.format();
+        let scaler = match &mut self.scaler {
+            Some(s) => s,
+            None => {
+                let ctx = ffmpeg_next::software::scaling::Context::get(
+                    src_format, width, height, ffmpeg_next::util::format::Pixel::RGB24, width, height,
+                    ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Scaler: {}", e)))?;
+                self.scaler.insert(ctx)
+            }
+        };
+
+        let mut rgb_frame = ffmpeg_next::frame::Video::new(ffmpeg_next::util::format::Pixel::RGB24, width, height);
+        scaler.run(&decoded, &mut rgb_frame).unwrap();
+
+        // Potong padding memori (stride)
+        let stride = rgb_frame.stride(0);
+        let row_width = (width as usize) * 3;
+        let mut data = Vec::with_capacity((height as usize) * row_width);
+        let raw_data = rgb_frame.data(0);
+        
+        for y in 0..(height as usize) {
+            let start = y * stride;
+            data.extend_from_slice(&raw_data[start..start + row_width]);
+        }
+
+        let arr = Array3::from_shape_vec((height as usize, width as usize, 3), data).unwrap();
+        Ok(arr.into_pyarray(py).into())
+    }
+
 // ═══════════════════════════════════════════════
 // DAFTARKAN KE MODUL
 // ═══════════════════════════════════════════════
