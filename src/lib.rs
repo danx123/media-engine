@@ -286,6 +286,12 @@ struct Shared {
     stop: AtomicBool,
     eof: AtomicBool,
 
+    // Auto-restart dari awal kalau nyampe EOF.
+    loop_enabled: AtomicBool,
+    // Sinyal one-shot ke decode thread: "decode & tampilin SATU frame video
+    // lagi walopun lagi paused". Dipakai buat frame-step (scrubbing per-frame).
+    step_request: AtomicBool,
+
     // Basis clock: pts pemutaran dimulai dari sini + (waktu berjalan sejak play()).
     // Dipakai kalau video tanpa audio, atau sebelum audio callback mulai jalan.
     clock_base_pts: Mutex<f64>,
@@ -384,6 +390,8 @@ impl PlayerEngine {
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             eof: AtomicBool::new(false),
+            loop_enabled: AtomicBool::new(false),
+            step_request: AtomicBool::new(false),
             clock_base_pts: Mutex::new(0.0),
             clock_base_wall: Mutex::new(None),
         });
@@ -476,16 +484,63 @@ impl PlayerEngine {
     /// Mulai/lanjutkan playback.
     fn play(&mut self) {
         if !self.shared.playing.swap(true, Ordering::SeqCst) {
+            // Resume stream audio DULU sebelum reset wall-clock, biar gak ada
+            // celah di mana clock udah jalan tapi audio belom bener2 keluar.
+            if let Some(stream) = self._audio_stream.as_ref() {
+                let _ = stream.play();
+            }
             *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
         }
     }
 
-    /// Jeda playback (decode thread juga berhenti ngedecode paket baru).
+    /// Jeda playback. Ini nge-freeze SEMUANYA: decode thread berhenti baca
+    /// paket baru, DAN stream audio cpal-nya beneran di-pause (bukan cuma
+    /// decode-nya doang) -- kalau ini kelewat, sisa buffer readahead (~2
+    /// detik) bakal tetep kebunyi & bikin clock (makanya seekbar) keliatan
+    /// jalan terus meski status-nya "paused".
     fn pause(&mut self) {
+        if let Some(stream) = self._audio_stream.as_ref() {
+            let _ = stream.pause();
+        }
         // Simpen posisi sekarang sbg base baru biar gak lompat pas resume.
+        // Dipanggil SETELAH stream di-pause biar audio_frames_played udah
+        // gak nambah lagi pas dibaca di sini.
         let pos = self.shared.position();
         *self.shared.clock_base_pts.lock().unwrap() = pos;
         self.shared.playing.store(false, Ordering::SeqCst);
+    }
+
+    /// True kalau lagi playing (bukan paused/belum di-play sama sekali).
+    fn is_playing(&self) -> bool {
+        self.shared.playing.load(Ordering::Relaxed)
+    }
+
+    /// Hentikan playback & balikin posisi ke awal file (detik 0), freeze.
+    /// Beda sama pause(): stop() juga nge-reset posisi, bukan cuma nahan
+    /// di posisi sekarang.
+    fn stop(&mut self) {
+        self.pause();
+        self.seek(0.0);
+    }
+
+    /// Nyalain/matiin auto-restart dari awal pas playback nyampe akhir file.
+    fn set_loop(&mut self, enabled: bool) {
+        self.shared.loop_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    fn is_looping(&self) -> bool {
+        self.shared.loop_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Maju SATU frame video. Cuma masuk akal dipanggil pas lagi paused --
+    /// kalau lagi playing, ini gak ngapa2in (biar gak bentrok sama decode
+    /// thread yang emang lagi jalan normal). Setelah dipanggil, tunggu 1-2
+    /// tick lalu ambil hasilnya lewat get_frame() seperti biasa -- clock
+    /// otomatis ikut digeser ke pts frame yang baru itu.
+    fn step_frame(&mut self) {
+        if !self.shared.playing.load(Ordering::Relaxed) {
+            self.shared.step_request.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Lompat ke detik tertentu. Non-blocking — decode thread yang
@@ -647,7 +702,40 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(10));
+            if shared.step_request.swap(false, Ordering::SeqCst) {
+                // Frame-step: paksa decode satu frame video ke depan meski
+                // lagi paused, lalu geser clock persis ke pts frame itu --
+                // jadi get_frame() normal di sisi Python otomatis nemu &
+                // nampilin frame ini di tick berikutnya, gak perlu jalur
+                // spesial di get_frame().
+                let mut produced = false;
+                for _ in 0..500 {
+                    let next_packet = input_ctx.packets().next();
+                    let (stream, packet) = match next_packet {
+                        Some(p) => p,
+                        None => {
+                            shared.eof.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    };
+                    if Some(stream.index()) != video_idx {
+                        continue; // step cuma peduli video, paket audio dilewatin
+                    }
+                    if let Some(d) = vdecoder.as_mut() {
+                        if d.send_packet(&packet).is_ok() && d.receive_frame(&mut vframe).is_ok() {
+                            let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                            if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, d.format(), vwidth, vheight) {
+                                shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                                shared.reset_clock(pts);
+                                produced = true;
+                            }
+                        }
+                    }
+                    if produced { break; }
+                }
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
             continue;
         }
 
@@ -667,7 +755,15 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
                 // EOF: flush sisa frame yang masih ngendon di decoder.
                 if let Some(d) = vdecoder.as_mut() { let _ = d.send_eof(); }
                 if let Some(d) = adecoder.as_mut() { let _ = d.send_eof(); }
-                shared.eof.store(true, Ordering::Relaxed);
+                if shared.loop_enabled.load(Ordering::Relaxed) {
+                    // Auto-restart: minta seek ke detik 0, ditangani di iterasi
+                    // berikutnya lewat blok seek_to di atas -- jadi flush
+                    // decoder & bersih2 queue-nya tetep konsisten sama jalur
+                    // seek manual, gak ada logic duplikat di sini.
+                    *shared.seek_to.lock().unwrap() = Some(0.0);
+                } else {
+                    shared.eof.store(true, Ordering::Relaxed);
+                }
                 thread::sleep(Duration::from_millis(20));
                 continue;
             }
