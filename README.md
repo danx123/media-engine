@@ -153,12 +153,4 @@ To build locally for testing on the compile machine:
 maturin develop --release
 ```
 
-## Known limitations / not implemented
-
-- No subtitle track support.
-- No hardware-accelerated decoding (DXVA2/D3D11VA/Media Foundation are explicitly disabled in the FFmpeg build config to keep the cross-compile toolchain manageable). Playback is software-decoded only — 4K on modest CPUs may still be a bottleneck. Worth revisiting if it ever becomes the limiting factor.
-- No multi-audio-track selection — always decodes the "best" audio stream FFmpeg picks.
-- `audio_buf` is a `Mutex<VecDeque<f32>>` consumed inside a real-time audio callback. This is not lock-free. It's been fine in testing, but if audible glitches/crackling ever show up under load, swap it for a lock-free SPSC ring buffer (the `ringbuf` crate is the natural fit) rather than trying to tune the mutex.
-- No frame-step (single-frame advance while paused) API yet on `PlayerEngine` — use `VideoDecoder` for that use case in the meantime.
-- No `is_playing()` getter yet — callers currently need to track play/pause state on their own side.
 
