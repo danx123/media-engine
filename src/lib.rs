@@ -444,7 +444,18 @@ impl PlayerEngine {
                     };
 
                     if let Ok(stream) = build_result {
-                        let _ = stream.play();
+                        // JANGAN langsung .play() di sini. Kalau langsung jalan,
+                        // callback di atas bakal langsung mulai narik audio_buf
+                        // yang masih kosong (decode thread belom sempet ngisi
+                        // apa2), dan tetep nambah audio_frames_played walopun
+                        // yang keluar cuma silence-filler. Efeknya: clock udah
+                        // "maju" duluan sebelum ada suara asli yang kebunyi,
+                        // dan video bakal ngerasa harus ngejar dari awal --
+                        // persis gejala "video-audio kerasa ada jeda" yang
+                        // nempel terus sepanjang playback. Stream ini baru
+                        // beneran di-play() pas play()/seek() Python dipanggil,
+                        // sesudah buffer di-priming (lihat prime_audio_buffer).
+                        let _ = stream.pause();
                         audio_stream = Some(stream);
                     } else {
                         // Gagal setup audio device -> tetep jalan sebagai video-only,
@@ -484,8 +495,11 @@ impl PlayerEngine {
     /// Mulai/lanjutkan playback.
     fn play(&mut self) {
         if !self.shared.playing.swap(true, Ordering::SeqCst) {
-            // Resume stream audio DULU sebelum reset wall-clock, biar gak ada
-            // celah di mana clock udah jalan tapi audio belom bener2 keluar.
+            // Tunggu buffer keisi cukup DULU sebelum stream cpal beneran
+            // dibuka, biar begitu kebunyi langsung isi asli -- bukan
+            // silence yang ngasih clock keburu maju (lihat catatan di
+            // constructor soal kenapa stream gak langsung di-play di sana).
+            self.prime_audio_buffer();
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
@@ -545,9 +559,30 @@ impl PlayerEngine {
 
     /// Lompat ke detik tertentu. Non-blocking — decode thread yang
     /// beneran ngerjain seek di background.
+    /// Lompat ke detik tertentu. Kalau lagi playing, audio stream dipause
+    /// sesaat sementara nunggu decode thread ngisi ulang buffer pasca-seek
+    /// (yg otomatis dikosongin) -- kalau nggak, sama kayak masalah di
+    /// play(): stream bakal narik buffer kosong dan clock keburu maju
+    /// duluan sebelum ada suara baru yg beneran kebunyi, bikin drift kecil
+    /// tiap abis seek. Kalau lagi paused, gak ada yang perlu ditunggu
+    /// (stream emang udah diem).
     fn seek(&mut self, second: f64) {
+        let was_playing = self.shared.playing.load(Ordering::Relaxed);
+        if was_playing {
+            if let Some(stream) = self._audio_stream.as_ref() {
+                let _ = stream.pause();
+            }
+        }
+
         self.shared.eof.store(false, Ordering::SeqCst);
         *self.shared.seek_to.lock().unwrap() = Some(second);
+
+        if was_playing {
+            self.prime_audio_buffer();
+            if let Some(stream) = self._audio_stream.as_ref() {
+                let _ = stream.play();
+            }
+        }
     }
 
     /// Posisi playback sekarang (detik), dihitung dari clock audio
@@ -621,6 +656,34 @@ impl PlayerEngine {
         if let Some(h) = self.decode_thread.take() {
             let _ = h.join();
         }
+    }
+}
+
+/// Helper internal -- sengaja dipisah dari blok #[pymethods] di atas
+/// biar gak ikut ke-expose sebagai method Python.
+impl PlayerEngine {
+    /// Tunggu (dibatasi ~300ms) sampe audio_buf keisi minimal ~150ms sample
+    /// baru, sebelum stream cpal beneran dibuka/dibuka-lagi. Dipanggil dari
+    /// play() dan seek() -- keduanya sama-sama titik rawan stream narik
+    /// buffer kosong dan bikin clock maju duluan drpd suara aslinya.
+    /// Timeout ada biar UI gak nge-hang selamanya kalau misal decode
+    /// thread lambat start atau macet.
+    fn prime_audio_buffer(&self) {
+        if !self.has_audio {
+            return;
+        }
+        let sr = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as usize;
+        let ch = self.shared.out_channels.load(Ordering::Relaxed).max(1) as usize;
+        let target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            if self.shared.audio_buf.lock().unwrap().len() >= target {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Timeout -- lanjut aja apa adanya. Mending mulai agak nunda drpd
+        // UI (tombol Play/seekbar) kekunci nunggu tanpa batas.
     }
 }
 
