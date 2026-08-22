@@ -134,9 +134,8 @@ jobs:
             --enable-dxva2 \
             --enable-d3d11va \
             --enable-mediafoundation \
-            --enable-libdav1d \
-            --pkg-config="pkg-config --static"
-
+            --enable-libdav1d 
+            
           make -j"$(nproc)"
           make install
 
