@@ -111,6 +111,8 @@ jobs:
         run: |
           git clone --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
           cd ffmpeg-src
+          
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-windows/lib/pkgconfig:$PKG_CONFIG_PATH"
 
           ./configure \
             --prefix="$HOME/ffmpeg-windows" \
@@ -134,7 +136,8 @@ jobs:
             --enable-dxva2 \
             --enable-d3d11va \
             --enable-mediafoundation \
-            --enable-libdav1d 
+            --enable-libdav1d \
+            --pkg-config="pkg-config --static"
             
           make -j"$(nproc)"
           make install
