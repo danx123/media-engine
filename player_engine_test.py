@@ -21,6 +21,7 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QFileDialog, QMessageBox, QSizePolicy,
+    QCheckBox,
 )
 
 try:
@@ -110,6 +111,19 @@ class PlayerTestWindow(QMainWindow):
         self.play_btn.clicked.connect(self._on_play_pause)
         self.play_btn.setEnabled(False)
 
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.clicked.connect(self._on_stop)
+        self.stop_btn.setEnabled(False)
+
+        self.next_frame_btn = QPushButton("⏭ Frame")
+        self.next_frame_btn.setToolTip("Maju satu frame (aktif kalau lagi paused)")
+        self.next_frame_btn.clicked.connect(self._on_next_frame)
+        self.next_frame_btn.setEnabled(False)
+
+        self.loop_checkbox = QCheckBox("Loop")
+        self.loop_checkbox.toggled.connect(self._on_loop_toggled)
+        self.loop_checkbox.setEnabled(False)
+
         self.mute_btn = QPushButton("🔊")
         self.mute_btn.setFixedWidth(36)
         self.mute_btn.clicked.connect(self._on_toggle_mute)
@@ -127,6 +141,9 @@ class PlayerTestWindow(QMainWindow):
 
         btn_row.addWidget(self.open_btn)
         btn_row.addWidget(self.play_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.next_frame_btn)
+        btn_row.addWidget(self.loop_checkbox)
         btn_row.addSpacing(12)
         btn_row.addWidget(self.mute_btn)
         btn_row.addWidget(self.volume_slider)
@@ -177,6 +194,10 @@ class PlayerTestWindow(QMainWindow):
         self.video_label.setText("")
         self.play_btn.setEnabled(True)
         self.play_btn.setText("▶ Play")
+        self.stop_btn.setEnabled(True)
+        self.next_frame_btn.setEnabled(True)
+        self.loop_checkbox.setEnabled(True)
+        self.engine.set_loop(self.loop_checkbox.isChecked())
 
         # Sinkronin volume/mute engine baru ke posisi slider yang lagi aktif
         # di UI (bukan ke default engine), biar konsisten antar ganti file.
@@ -195,14 +216,32 @@ class PlayerTestWindow(QMainWindow):
     def _on_play_pause(self):
         if self.engine is None:
             return
-        # Belum ada getter is_playing di Rust-nya, jadi status di-track
-        # lewat teks tombol aja buat testbed ini.
-        if self.play_btn.text().startswith("▶"):
-            self.engine.play()
-            self.play_btn.setText("⏸ Pause")
-        else:
+        if self.engine.is_playing():
             self.engine.pause()
             self.play_btn.setText("▶ Play")
+        else:
+            self.engine.play()
+            self.play_btn.setText("⏸ Pause")
+
+    def _on_stop(self):
+        if self.engine is None:
+            return
+        self.engine.stop()
+        self.play_btn.setText("▶ Play")
+        # Paksa satu tick manual biar frame pertama abis stop langsung
+        # muncul di layar, gak nunggu play() ditekan dulu.
+        self._on_tick()
+
+    def _on_next_frame(self):
+        if self.engine is None:
+            return
+        if self.engine.is_playing():
+            return  # frame-step cuma masuk akal pas paused
+        self.engine.step_frame()
+
+    def _on_loop_toggled(self, checked: bool):
+        if self.engine is not None:
+            self.engine.set_loop(checked)
 
     def _on_toggle_mute(self):
         if self.engine is None:
@@ -251,6 +290,9 @@ class PlayerTestWindow(QMainWindow):
             self.tick_timer.stop()
             self.play_btn.setText("▶ Play")
             self.status_label.setText(self.status_label.text() + "  [Selesai]")
+        # Catatan: kalau Loop dicentang, is_eof() gak akan pernah true --
+        # engine otomatis seek balik ke 0 sendiri di dalem decode thread,
+        # jadi gak perlu ditangani manual di sisi Python sama sekali.
 
     def _show_frame(self, rgb_array):
         h, w, _ = rgb_array.shape
