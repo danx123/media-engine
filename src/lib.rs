@@ -3,12 +3,21 @@ use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use numpy::{IntoPyArray, PyArray3, ndarray::Array3};
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use ringbuf::traits::{Consumer as _, Observer as _, Producer as _, Split as _};
+
+// Alias biar gampang disesuaikan kalau nama tipe exact-nya beda dikit di
+// versi `ringbuf` yang kepasang (API crate ini sempat berubah antar versi
+// minor -- kalau compiler komplen "cannot find type HeapProd/HeapCons",
+// cek `cargo doc --open -p ringbuf` terus ganti target alias di sini aja,
+// gak perlu ubah kode pemakainya di bawah).
+type AudioProducer = ringbuf::HeapProd<f32>;
+type AudioConsumer = ringbuf::HeapCons<f32>;
 
 // ═══════════════════════════════════════════════
 // INISIALISASI FFmpeg (sekali saja saat dimuat)
@@ -266,7 +275,27 @@ struct QueuedFrame {
 /// Semua field pakai atomic/Mutex karena diakses dari 2 thread.
 struct Shared {
     video_q: Mutex<VecDeque<QueuedFrame>>,
-    audio_buf: Mutex<VecDeque<f32>>, // interleaved, sample rate & channel = device output
+
+    // Buffer sample audio SENDIRI (bukan di sini) -- itu ring buffer
+    // lock-free (`ringbuf`) yang producer-nya dipegang decode thread dan
+    // consumer-nya dipegang callback cpal, gak lewat Shared/Mutex sama
+    // sekali. Dulu di sini ada `audio_buf: Mutex<VecDeque<f32>>`, tapi
+    // Mutex yang dikunci dari REAL-TIME audio callback itu rawan glitch:
+    // begitu decode thread lagi megang lock buat nge-`extend()` (apalagi
+    // pas VecDeque kebetulan perlu realokasi), callback bisa ke-delay
+    // ngelewatin deadline periode audio device -> kedengeran kresek/glitch.
+    // Ring buffer SPSC gak butuh lock sama sekali buat push/pop, jadi
+    // masalah ini ilang di akarnya.
+    audio_buffered_hint: AtomicUsize, // isi ring buffer sample, diupdate decode thread abis tiap push
+    // One-shot flag: "buang semua sample yg lagi ngendon di ring buffer
+    // SEBELUM lanjut konsumsi normal". Di-set true dari reset_clock() (jadi
+    // otomatis kepasang tiap ada seek/step/loop-restart), dibaca & di-reset
+    // ke false sekali sama audio callback. AMAN dipasang dari decode thread
+    // karena producer gak bisa "clear" ring buffer-nya sendiri (yang megang
+    // posisi baca itu consumer, hidup di thread audio) -- jadi sinyal ini
+    // yang nyuruh consumer-nya sendiri yang beresin.
+    audio_flush: AtomicBool,
+
     // Jumlah "sample frame" (bukan float individual) yang udah beneran
     // dibunyikan lewat callback cpal -> ini jadi master clock kalau ada audio.
     audio_frames_played: AtomicU64,
@@ -326,10 +355,24 @@ impl Shared {
         }
     }
 
-    fn reset_clock(&self, pts: f64) {
+    /// Bekukan clock di posisi sekarang TANPA nge-flush ring buffer audio.
+    /// Dipakai buat pause() -- beda sama seek/step, pause itu bukan
+    /// diskontinuitas timeline, buffer readahead yang udah kebentuk masih
+    /// 100% valid buat dilanjutin pas resume, jadi jangan dibuang.
+    fn freeze_clock(&self, pts: f64) {
         *self.clock_base_pts.lock().unwrap() = pts;
         *self.clock_base_wall.lock().unwrap() = Some(Instant::now());
         self.audio_frames_played.store(0, Ordering::Relaxed);
+    }
+
+    /// Reset clock ke titik waktu tertentu KARENA timeline abis loncat:
+    /// seek manual, frame-step, atau auto-restart loop. Beda sama
+    /// freeze_clock(), ini JUGA nge-flush ring buffer audio -- sample lama
+    /// yg masih ngendon di situ udah gak valid lagi buat posisi baru ini.
+    fn reset_clock(&self, pts: f64) {
+        self.freeze_clock(pts);
+        self.audio_flush.store(true, Ordering::Relaxed);
+        self.audio_buffered_hint.store(0, Ordering::Relaxed);
     }
 }
 
@@ -379,7 +422,8 @@ impl PlayerEngine {
 
         let shared = Arc::new(Shared {
             video_q: Mutex::new(VecDeque::new()),
-            audio_buf: Mutex::new(VecDeque::new()),
+            audio_buffered_hint: AtomicUsize::new(0),
+            audio_flush: AtomicBool::new(false),
             audio_frames_played: AtomicU64::new(0),
             out_sample_rate: AtomicI64::new(48000),
             out_channels: AtomicI64::new(2),
@@ -398,10 +442,13 @@ impl PlayerEngine {
 
         // ── Setup cpal output stream (kalau ada audio) ──
         // Callback ini jalan di audio thread milik OS (real-time), jadi
-        // JANGAN pernah block lama di sini. Mutex di sini masih ada risiko
-        // kecil (priority inversion) — kalau kedengeran krek-krek di
-        // playback, ganti audio_buf ke ring buffer lock-free (crate `ringbuf`).
+        // JANGAN pernah block lama di sini. Buffer sample-nya pakai ring
+        // buffer SPSC lock-free (`ringbuf`), bukan Mutex<VecDeque> -- Mutex
+        // yang dikunci dari sini rawan bikin glitch kalau decode thread
+        // kebetulan lagi megang lock pas callback butuh jalan (apalagi kalau
+        // sampe ada realokasi Vec di baliknya).
         let mut audio_stream: Option<cpal::Stream> = None;
+        let mut audio_producer: Option<AudioProducer> = None;
         if has_audio {
             let host = cpal::default_host();
             if let Some(device) = host.default_output_device() {
@@ -411,6 +458,13 @@ impl PlayerEngine {
                     shared.out_sample_rate.store(sample_rate, Ordering::Relaxed);
                     shared.out_channels.store(channels, Ordering::Relaxed);
 
+                    // ~3 detik headroom -- lebih gede dikit drpd batas
+                    // backpressure (a_cap, ~2 detik di decode thread) biar
+                    // producer nyaris gak pernah kejadian nabrak penuh.
+                    let capacity = ((sample_rate as usize) * (channels as usize) * 3).max(4096);
+                    let rb = ringbuf::HeapRb::<f32>::new(capacity);
+                    let (producer, mut consumer) = rb.split();
+
                     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
                     let shared_cb = Arc::clone(&shared);
 
@@ -418,17 +472,22 @@ impl PlayerEngine {
                         cpal::SampleFormat::F32 => device.build_output_stream(
                             &stream_cfg,
                             move |data: &mut [f32], _| {
-                                let mut buf = shared_cb.audio_buf.lock().unwrap();
+                                if shared_cb.audio_flush.swap(false, Ordering::Relaxed) {
+                                    // Timeline abis loncat (seek/step/loop-restart) --
+                                    // buang semua sample LAMA yg masih ngendon
+                                    // sebelum lanjut konsumsi normal. Tanpa ini,
+                                    // abis seek bakal kedengeran "kilas balik"
+                                    // sepersekian detik audio dari posisi lama.
+                                    while consumer.try_pop().is_some() {}
+                                }
                                 let ch = shared_cb.out_channels.load(Ordering::Relaxed).max(1) as usize;
                                 // Dibaca sekali per callback (bukan per-sample) biar gak ada
                                 // atomic load ribuan kali per buffer -- toh kuping gak bakal
                                 // notice volume berubah di tengah satu buffer (~ms doang).
                                 let vol = shared_cb.effective_volume();
-                                let mut i = 0;
-                                while i < data.len() {
+                                for sample in data.iter_mut() {
                                     // 0.0 = diam kalau buffer kosong (underrun)
-                                    data[i] = buf.pop_front().unwrap_or(0.0) * vol;
-                                    i += 1;
+                                    *sample = consumer.try_pop().unwrap_or(0.0) * vol;
                                 }
                                 // Frame count buat clock TETEP dihitung dari data yang
                                 // dikonsumsi apa adanya -- volume/mute gak boleh ganggu
@@ -445,7 +504,7 @@ impl PlayerEngine {
 
                     if let Ok(stream) = build_result {
                         // JANGAN langsung .play() di sini. Kalau langsung jalan,
-                        // callback di atas bakal langsung mulai narik audio_buf
+                        // callback di atas bakal langsung mulai narik ring buffer
                         // yang masih kosong (decode thread belom sempet ngisi
                         // apa2), dan tetep nambah audio_frames_played walopun
                         // yang keluar cuma silence-filler. Efeknya: clock udah
@@ -457,6 +516,7 @@ impl PlayerEngine {
                         // sesudah buffer di-priming (lihat prime_audio_buffer).
                         let _ = stream.pause();
                         audio_stream = Some(stream);
+                        audio_producer = Some(producer);
                     } else {
                         // Gagal setup audio device -> tetep jalan sebagai video-only,
                         // jangan gagalin seluruh player gara-gara audio device bermasalah.
@@ -477,7 +537,7 @@ impl PlayerEngine {
         let path_owned = file_path.to_string();
         let decode_thread = thread::Builder::new()
             .name("media_engine-decode".into())
-            .spawn(move || decode_loop(path_owned, thread_shared))
+            .spawn(move || decode_loop(path_owned, thread_shared, audio_producer))
             .map_err(|e| PyRuntimeError::new_err(format!("Spawn thread decode gagal: {}", e)))?;
 
         Ok(PlayerEngine {
@@ -516,18 +576,21 @@ impl PlayerEngine {
         if let Some(stream) = self._audio_stream.as_ref() {
             let _ = stream.pause();
         }
-        // PENTING: pakai reset_clock() (bukan cuma nulis clock_base_pts
-        // manual) karena reset_clock() JUGA nge-nolin audio_frames_played
-        // balik ke 0. Kalau frames_played dibiarin jalan terus dari angka
-        // lama sementara base udah "menyerap" nilai lama itu juga, position()
-        // = base + frames/sr bakal DOBEL-ngitung waktu yang sama tiap siklus
-        // pause->resume -- position() jadi jauh melenceng dari pts frame
-        // manapun di queue, semua frame video keanggep "telat" dan didrop
-        // terus-terusan (video macet total), sementara audio gak kena
-        // imbasnya sama sekali karena audio callback gak pernah baca
-        // position(), dia cuma narik dari buffernya sendiri.
+        // PENTING: pakai freeze_clock() (bukan reset_clock()) -- pause itu
+        // BUKAN diskontinuitas timeline kayak seek, buffer readahead yang
+        // udah kebentuk masih valid buat dilanjutin pas resume, jangan
+        // sampe ke-flush. Yang WAJIB tetep dilakuin cuma nge-nolin
+        // audio_frames_played bareng base -- kalau frames_played dibiarin
+        // jalan terus dari angka lama sementara base udah "menyerap" nilai
+        // lama itu juga, position() = base + frames/sr bakal DOBEL-ngitung
+        // waktu yang sama tiap siklus pause->resume -- position() jadi jauh
+        // melenceng dari pts frame manapun di queue, semua frame video
+        // keanggep "telat" dan didrop terus-terusan (video macet total),
+        // sementara audio gak kena imbasnya sama sekali karena audio
+        // callback gak pernah baca position(), dia cuma narik dari
+        // buffernya sendiri.
         let pos = self.shared.position();
-        self.shared.reset_clock(pos);
+        self.shared.freeze_clock(pos);
         self.shared.playing.store(false, Ordering::SeqCst);
     }
 
@@ -667,7 +730,7 @@ impl PlayerEngine {
 /// Helper internal -- sengaja dipisah dari blok #[pymethods] di atas
 /// biar gak ikut ke-expose sebagai method Python.
 impl PlayerEngine {
-    /// Tunggu (dibatasi ~300ms) sampe audio_buf keisi minimal ~150ms sample
+    /// Tunggu (dibatasi ~300ms) sampe ring buffer audio keisi minimal ~150ms sample
     /// baru, sebelum stream cpal beneran dibuka/dibuka-lagi. Dipanggil dari
     /// play() dan seek() -- keduanya sama-sama titik rawan stream narik
     /// buffer kosong dan bikin clock maju duluan drpd suara aslinya.
@@ -682,7 +745,7 @@ impl PlayerEngine {
         let target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
         let deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < deadline {
-            if self.shared.audio_buf.lock().unwrap().len() >= target {
+            if self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= target {
                 return;
             }
             thread::sleep(Duration::from_millis(5));
@@ -701,7 +764,7 @@ impl Drop for PlayerEngine {
 /// Loop utama thread decode: demux, decode video+audio, isi queue/buffer.
 /// Jalan independen dari GIL Python — cuma method get_frame() yang perlu GIL,
 /// dan itu cuma buat konversi Vec<u8> -> PyArray, bukan buat decode-nya.
-fn decode_loop(file_path: String, shared: Arc<Shared>) {
+fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Option<AudioProducer>) {
     let path = Path::new(&file_path);
     let mut input_ctx = match ffmpeg_next::format::input(&path) {
         Ok(i) => i,
@@ -763,7 +826,11 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
                 if let Some(d) = vdecoder.as_mut() { d.flush(); }
                 if let Some(d) = adecoder.as_mut() { d.flush(); }
                 shared.video_q.lock().unwrap().clear();
-                shared.audio_buf.lock().unwrap().clear();
+                // Ring buffer audio gak perlu (gak bisa) di-clear dari sisi
+                // producer di sini -- reset_clock() di bawah udah masang
+                // audio_flush=true, dan itu yang bakal dibaca+dieksekusi
+                // sama audio callback (yang megang consumer-nya) sebelum
+                // dia lanjut konsumsi normal.
                 shared.reset_clock(sec);
                 shared.eof.store(false, Ordering::Relaxed);
             }
@@ -808,8 +875,10 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
         }
 
         // Backpressure: jangan decode lebih cepet dari yang dibutuhin buat nampilin.
+        // Panggil occupied_len() langsung ke producer -- ini aman & murah
+        // (gak butuh lock/atomic) krn producer emang cuma dipegang thread ini.
         let q_len = shared.video_q.lock().unwrap().len();
-        let a_len = shared.audio_buf.lock().unwrap().len();
+        let a_len = audio_producer.as_ref().map(|p| p.occupied_len()).unwrap_or(0);
         let a_cap = (out_rate as usize) * (out_channels as usize) * 2; // ~2 detik
         if q_len >= MAX_VIDEO_FRAMES || a_len >= a_cap {
             thread::sleep(Duration::from_millis(5));
@@ -873,7 +942,14 @@ fn decode_loop(file_path: String, shared: Arc<Shared>) {
                                     let floats: &[f32] = unsafe {
                                         std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
                                     };
-                                    shared.audio_buf.lock().unwrap().extend(floats.iter().copied());
+                                    if let Some(prod) = audio_producer.as_mut() {
+                                        // Kalau ring buffer kebetulan lagi penuh (jarang,
+                                        // krn backpressure di atas), push_slice cuma
+                                        // ngambil sebisanya & sisanya didrop -- gak
+                                        // masalah, itu cuma beberapa ms sample doang.
+                                        let _ = prod.push_slice(floats);
+                                        shared.audio_buffered_hint.store(prod.occupied_len(), Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
