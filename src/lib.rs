@@ -1145,7 +1145,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
         }
         }
     }
-}
+
 
 fn scale_to_rgb(
     decoded: &ffmpeg_next::frame::Video,
