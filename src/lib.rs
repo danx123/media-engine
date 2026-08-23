@@ -310,7 +310,16 @@ struct Shared {
     volume_bits: AtomicU32,
     muted: AtomicBool,
 
-    seek_to: Mutex<Option<f64>>,
+    // Mekanisme seek pakai "generation counter", BUKAN Option<f64> yang
+    // di-`take()` -- itu cuma bisa dikonsumsi SEKALI sama SATU pembaca.
+    // Sekarang ada 2 thread decode (video & audio) yang masing-masing
+    // butuh tau ada seek baru & ngerjain seek versi mereka sendiri (buka
+    // file handle sendiri-sendiri) -- generation counter bikin keduanya
+    // bisa independen ngecek "apa ada seek yang belom gue apply?" tanpa
+    // rebutan konsumsi satu sinyal yang sama.
+    seek_seq: AtomicU64,
+    seek_target: Mutex<f64>,
+
     playing: AtomicBool,
     stop: AtomicBool,
     eof: AtomicBool,
@@ -382,7 +391,8 @@ const LATE_FRAME_DROP_SEC: f64 = 0.1; // frame yg telat >100ms dianggap basi
 #[pyclass(unsendable)]
 struct PlayerEngine {
     shared: Arc<Shared>,
-    decode_thread: Option<JoinHandle<()>>,
+    video_thread: Option<JoinHandle<()>>,
+    audio_thread: Option<JoinHandle<()>>,
     _audio_stream: Option<cpal::Stream>, // harus tetep hidup selama playback
     #[pyo3(get)] duration: f64,
     #[pyo3(get)] width: u32,
@@ -430,7 +440,8 @@ impl PlayerEngine {
             has_audio: AtomicBool::new(has_audio),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             muted: AtomicBool::new(false),
-            seek_to: Mutex::new(None),
+            seek_seq: AtomicU64::new(0),
+            seek_target: Mutex::new(0.0),
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             eof: AtomicBool::new(false),
@@ -463,7 +474,7 @@ impl PlayerEngine {
                     // producer nyaris gak pernah kejadian nabrak penuh.
                     let capacity = ((sample_rate as usize) * (channels as usize) * 3).max(4096);
                     let rb = ringbuf::HeapRb::<f32>::new(capacity);
-                    let (producer, mut consumer) = rb.split();
+                    let (producer, mut consumer): (AudioProducer, AudioConsumer) = rb.split();
 
                     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
                     let shared_cb = Arc::clone(&shared);
@@ -532,17 +543,38 @@ impl PlayerEngine {
 
         let final_has_audio = shared.has_audio.load(Ordering::Relaxed);
 
-        // ── Spawn thread decode ──
-        let thread_shared = Arc::clone(&shared);
-        let path_owned = file_path.to_string();
-        let decode_thread = thread::Builder::new()
-            .name("media_engine-decode".into())
-            .spawn(move || decode_loop(path_owned, thread_shared, audio_producer))
-            .map_err(|e| PyRuntimeError::new_err(format!("Spawn thread decode gagal: {}", e)))?;
+        // ── Spawn thread video & audio TERPISAH ──
+        // Ini kunci fix-nya: dulu satu thread ngurusin demux+decode video
+        // DAN audio bareng, gantian satu paket per iterasi. Begitu video
+        // kena beban berat (keyframe gede, atau abis seek yang butuh
+        // "ngejar" dari keyframe terdekat ke posisi target), audio ikut
+        // ke-block nungguin gantian -- ring buffer-nya gak ke-isi selama
+        // itu -> underrun/glitch. Dengan 2 thread + 2 file handle sendiri,
+        // video yang lagi berat gak akan pernah bisa mem-block audio lagi.
+        let video_shared = Arc::clone(&shared);
+        let video_path = file_path.to_string();
+        let video_thread = thread::Builder::new()
+            .name("media_engine-video".into())
+            .spawn(move || video_decode_loop(video_path, video_shared))
+            .map_err(|e| PyRuntimeError::new_err(format!("Spawn thread video gagal: {}", e)))?;
+
+        let audio_thread = if let Some(producer) = audio_producer {
+            let audio_shared = Arc::clone(&shared);
+            let audio_path = file_path.to_string();
+            Some(
+                thread::Builder::new()
+                    .name("media_engine-audio".into())
+                    .spawn(move || audio_decode_loop(audio_path, audio_shared, producer))
+                    .map_err(|e| PyRuntimeError::new_err(format!("Spawn thread audio gagal: {}", e)))?,
+            )
+        } else {
+            None
+        };
 
         Ok(PlayerEngine {
             shared,
-            decode_thread: Some(decode_thread),
+            video_thread: Some(video_thread),
+            audio_thread,
             _audio_stream: audio_stream,
             duration,
             width,
@@ -643,7 +675,8 @@ impl PlayerEngine {
         }
 
         self.shared.eof.store(false, Ordering::SeqCst);
-        *self.shared.seek_to.lock().unwrap() = Some(second);
+        *self.shared.seek_target.lock().unwrap() = second;
+        self.shared.seek_seq.fetch_add(1, Ordering::SeqCst);
 
         if was_playing {
             self.prime_audio_buffer();
@@ -717,11 +750,14 @@ impl PlayerEngine {
         Ok(Some((arr.into_pyarray(py).into(), frame.pts)))
     }
 
-    /// Hentikan playback & thread decode. Panggil eksplisit sebelum
+    /// Hentikan playback & kedua thread decode. Panggil eksplisit sebelum
     /// object di-drop kalau mau nutup lebih cepat / ganti file.
     fn close(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.decode_thread.take() {
+        if let Some(h) = self.video_thread.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.audio_thread.take() {
             let _ = h.join();
         }
     }
@@ -761,79 +797,68 @@ impl Drop for PlayerEngine {
     }
 }
 
-/// Loop utama thread decode: demux, decode video+audio, isi queue/buffer.
+/// Loop thread VIDEO: demux+decode video dari file handle-nya SENDIRI,
+/// isi video_q. Sama sekali gak nyentuh apapun soal audio -- itu urusan
+/// audio_decode_loop() yang jalan di thread lain, file handle lain.
 /// Jalan independen dari GIL Python — cuma method get_frame() yang perlu GIL,
 /// dan itu cuma buat konversi Vec<u8> -> PyArray, bukan buat decode-nya.
-fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Option<AudioProducer>) {
+fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     let path = Path::new(&file_path);
     let mut input_ctx = match ffmpeg_next::format::input(&path) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("[media_engine] gagal buka file di decode thread: {e}");
+            eprintln!("[media_engine] video thread gagal buka file: {e}");
             return;
         }
     };
 
-    let video_idx = input_ctx.streams().best(ffmpeg_next::media::Type::Video).map(|s| s.index());
-    let audio_idx = input_ctx.streams().best(ffmpeg_next::media::Type::Audio).map(|s| s.index());
-
-    let mut vdecoder = video_idx.and_then(|_| {
-        let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Video)?;
-        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()).ok()?;
-        ctx.decoder().video().ok()
-    });
-    let vwidth = vdecoder.as_ref().map(|d| d.width()).unwrap_or(0);
-    let vheight = vdecoder.as_ref().map(|d| d.height()).unwrap_or(0);
-    let vtb = video_idx.and_then(|_| {
-        let s = input_ctx.streams().best(ffmpeg_next::media::Type::Video)?;
-        let tb = s.time_base();
-        if tb.denominator() > 0 { Some(tb.numerator() as f64 / tb.denominator() as f64) } else { None }
-    }).unwrap_or(0.0);
-
-    let mut adecoder = if shared.has_audio.load(Ordering::Relaxed) {
-        audio_idx.and_then(|_| {
-            let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Audio)?;
-            let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()).ok()?;
-            ctx.decoder().audio().ok()
-        })
-    } else {
-        None
+    let video_idx = match input_ctx.streams().best(ffmpeg_next::media::Type::Video) {
+        Some(s) => s.index(),
+        None => return,
     };
-    let atb = audio_idx.and_then(|_| {
-        let s = input_ctx.streams().best(ffmpeg_next::media::Type::Audio)?;
+    let mut vdecoder = {
+        let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
+        match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .ok()
+            .and_then(|ctx| ctx.decoder().video().ok())
+        {
+            Some(d) => d,
+            None => return,
+        }
+    };
+    let vwidth = vdecoder.width();
+    let vheight = vdecoder.height();
+    let vtb = {
+        let s = input_ctx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
         let tb = s.time_base();
-        if tb.denominator() > 0 { Some(tb.numerator() as f64 / tb.denominator() as f64) } else { None }
-    }).unwrap_or(0.0);
-
-    let out_rate = shared.out_sample_rate.load(Ordering::Relaxed) as u32;
-    let out_channels = shared.out_channels.load(Ordering::Relaxed) as u16;
-    let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::default(out_channels as i32);
+        if tb.denominator() > 0 { tb.numerator() as f64 / tb.denominator() as f64 } else { 0.0 }
+    };
 
     let mut scaler: Option<ffmpeg_next::software::scaling::Context> = None;
-    let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
-
     let mut vframe = ffmpeg_next::frame::Video::empty();
-    let mut aframe = ffmpeg_next::frame::Audio::empty();
+    let mut applied_seek_seq: u64 = 0;
+    let mut sent_eof = false;
 
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             break;
         }
 
-        if let Some(sec) = shared.seek_to.lock().unwrap().take() {
+        // Generation counter: bandingin sama versi terakhir yang UDAH
+        // diterapin thread ini. Kalau beda, ada seek baru (manual ATAU
+        // auto-loop-restart) yang belom diterapin -- terapin sekarang.
+        let current_seq = shared.seek_seq.load(Ordering::SeqCst);
+        if current_seq != applied_seek_seq {
+            let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
             if input_ctx.seek(ts, ..ts).is_ok() {
-                if let Some(d) = vdecoder.as_mut() { d.flush(); }
-                if let Some(d) = adecoder.as_mut() { d.flush(); }
+                vdecoder.flush();
                 shared.video_q.lock().unwrap().clear();
-                // Ring buffer audio gak perlu (gak bisa) di-clear dari sisi
-                // producer di sini -- reset_clock() di bawah udah masang
-                // audio_flush=true, dan itu yang bakal dibaca+dieksekusi
-                // sama audio callback (yang megang consumer-nya) sebelum
-                // dia lanjut konsumsi normal.
                 shared.reset_clock(sec);
                 shared.eof.store(false, Ordering::Relaxed);
+                sent_eof = false;
             }
+            applied_seek_seq = current_seq;
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -853,17 +878,15 @@ fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Optio
                             break;
                         }
                     };
-                    if Some(stream.index()) != video_idx {
-                        continue; // step cuma peduli video, paket audio dilewatin
+                    if stream.index() != video_idx {
+                        continue;
                     }
-                    if let Some(d) = vdecoder.as_mut() {
-                        if d.send_packet(&packet).is_ok() && d.receive_frame(&mut vframe).is_ok() {
-                            let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
-                            if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, d.format(), vwidth, vheight) {
-                                shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
-                                shared.reset_clock(pts);
-                                produced = true;
-                            }
+                    if vdecoder.send_packet(&packet).is_ok() && vdecoder.receive_frame(&mut vframe).is_ok() {
+                        let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                        if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                            shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                            shared.reset_clock(pts);
+                            produced = true;
                         }
                     }
                     if produced { break; }
@@ -874,13 +897,11 @@ fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Optio
             continue;
         }
 
-        // Backpressure: jangan decode lebih cepet dari yang dibutuhin buat nampilin.
-        // Panggil occupied_len() langsung ke producer -- ini aman & murah
-        // (gak butuh lock/atomic) krn producer emang cuma dipegang thread ini.
+        // Backpressure: jangan decode lebih cepet dari yang dibutuhin buat
+        // nampilin. Cuma soal video_q di sini -- gak ada lagi urusan audio
+        // yang ikut nge-gate video kayak dulu.
         let q_len = shared.video_q.lock().unwrap().len();
-        let a_len = audio_producer.as_ref().map(|p| p.occupied_len()).unwrap_or(0);
-        let a_cap = (out_rate as usize) * (out_channels as usize) * 2; // ~2 detik
-        if q_len >= MAX_VIDEO_FRAMES || a_len >= a_cap {
+        if q_len >= MAX_VIDEO_FRAMES {
             thread::sleep(Duration::from_millis(5));
             continue;
         }
@@ -889,15 +910,17 @@ fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Optio
         let (stream, packet) = match next_packet {
             Some(p) => p,
             None => {
-                // EOF: flush sisa frame yang masih ngendon di decoder.
-                if let Some(d) = vdecoder.as_mut() { let _ = d.send_eof(); }
-                if let Some(d) = adecoder.as_mut() { let _ = d.send_eof(); }
+                if !sent_eof {
+                    let _ = vdecoder.send_eof();
+                    sent_eof = true;
+                }
                 if shared.loop_enabled.load(Ordering::Relaxed) {
-                    // Auto-restart: minta seek ke detik 0, ditangani di iterasi
-                    // berikutnya lewat blok seek_to di atas -- jadi flush
-                    // decoder & bersih2 queue-nya tetep konsisten sama jalur
-                    // seek manual, gak ada logic duplikat di sini.
-                    *shared.seek_to.lock().unwrap() = Some(0.0);
+                    // Auto-restart: minta seek ke detik 0 lewat generation
+                    // counter yang sama kayak seek manual -- audio_decode_loop
+                    // bakal ikut nangkep & seek balik ke 0 juga di iterasi
+                    // dia berikutnya, independen, gak perlu ditunggu di sini.
+                    *shared.seek_target.lock().unwrap() = 0.0;
+                    shared.seek_seq.fetch_add(1, Ordering::SeqCst);
                 } else {
                     shared.eof.store(true, Ordering::Relaxed);
                 }
@@ -906,54 +929,142 @@ fn decode_loop(file_path: String, shared: Arc<Shared>, mut audio_producer: Optio
             }
         };
 
-        if Some(stream.index()) == video_idx {
-            if let Some(d) = vdecoder.as_mut() {
-                if d.send_packet(&packet).is_ok() {
-                    while d.receive_frame(&mut vframe).is_ok() {
-                        let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
-                        if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, d.format(), vwidth, vheight) {
-                            shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
-                        }
-                    }
+        if stream.index() != video_idx {
+            continue;
+        }
+
+        if vdecoder.send_packet(&packet).is_ok() {
+            while vdecoder.receive_frame(&mut vframe).is_ok() {
+                let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                    shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
                 }
             }
-        } else if Some(stream.index()) == audio_idx {
-            if let Some(d) = adecoder.as_mut() {
-                if d.send_packet(&packet).is_ok() {
-                    while d.receive_frame(&mut aframe).is_ok() {
-                        if resampler.is_none() {
-                            let src_layout = if aframe.channel_layout().bits() != 0 {
-                                aframe.channel_layout()
-                            } else {
-                                ffmpeg_next::util::channel_layout::ChannelLayout::default(d.channels() as i32)
+        }
+    }
+}
+
+/// Loop thread AUDIO: demux+decode audio dari file handle-nya SENDIRI,
+/// resample ke format device, dorong ke ring buffer. Sama sekali gak
+/// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
+/// seek-nya independen total dari video, jadi video yang lagi berat gak
+/// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
+fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: AudioProducer) {
+    let path = Path::new(&file_path);
+    let mut input_ctx = match ffmpeg_next::format::input(&path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[media_engine] audio thread gagal buka file: {e}");
+            return;
+        }
+    };
+
+    let audio_idx = match input_ctx.streams().best(ffmpeg_next::media::Type::Audio) {
+        Some(s) => s.index(),
+        None => return,
+    };
+    let mut adecoder = {
+        let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
+        match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .ok()
+            .and_then(|ctx| ctx.decoder().audio().ok())
+        {
+            Some(d) => d,
+            None => return,
+        }
+    };
+
+    let out_rate = shared.out_sample_rate.load(Ordering::Relaxed) as u32;
+    let out_channels = shared.out_channels.load(Ordering::Relaxed) as u16;
+    let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::default(out_channels as i32);
+    let a_cap = (out_rate as usize) * (out_channels as usize) * 2; // ~2 detik, sama kayak sebelumnya
+
+    let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
+    let mut aframe = ffmpeg_next::frame::Audio::empty();
+    let mut applied_seek_seq: u64 = 0;
+    let mut sent_eof = false;
+
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let current_seq = shared.seek_seq.load(Ordering::SeqCst);
+        if current_seq != applied_seek_seq {
+            let sec = *shared.seek_target.lock().unwrap();
+            let ts = av_time_base_ts(sec);
+            if input_ctx.seek(ts, ..ts).is_ok() {
+                adecoder.flush();
+                // reset_clock() aman dipanggil dari kedua thread (video
+                // JUGA manggil ini buat generation yg sama) -- idempotent,
+                // nulis base+flush yang sama, gak ada efek dobel.
+                shared.reset_clock(sec);
+                sent_eof = false;
+            }
+            applied_seek_seq = current_seq;
+        }
+
+        if !shared.playing.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        if producer.occupied_len() >= a_cap {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let next_packet = input_ctx.packets().next();
+        let (stream, packet) = match next_packet {
+            Some(p) => p,
+            None => {
+                if !sent_eof {
+                    let _ = adecoder.send_eof();
+                    sent_eof = true;
+                }
+                // EOF di sisi audio gak nge-trigger apa2 (bukan yg megang
+                // status "selesai" buat UI, itu video_decode_loop). Kalau
+                // loop_enabled, video yang bakal bump seek_seq -- thread
+                // ini otomatis ikut nangkep lewat cek generation di atas.
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+
+        if stream.index() != audio_idx {
+            continue;
+        }
+
+        if adecoder.send_packet(&packet).is_ok() {
+            while adecoder.receive_frame(&mut aframe).is_ok() {
+                if resampler.is_none() {
+                    let src_layout = if aframe.channel_layout().bits() != 0 {
+                        aframe.channel_layout()
+                    } else {
+                        ffmpeg_next::util::channel_layout::ChannelLayout::default(adecoder.channels() as i32)
+                    };
+                    resampler = ffmpeg_next::software::resampling::Context::get(
+                        aframe.format(), src_layout, aframe.rate(),
+                        ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+                        out_layout, out_rate,
+                    ).ok();
+                }
+                if let Some(rs) = resampler.as_mut() {
+                    let mut resampled = ffmpeg_next::frame::Audio::empty();
+                    if rs.run(&aframe, &mut resampled).is_ok() {
+                        let n_samples = resampled.samples() * out_channels as usize;
+                        let raw = resampled.data(0);
+                        if raw.len() >= n_samples * 4 {
+                            let floats: &[f32] = unsafe {
+                                std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
                             };
-                            resampler = ffmpeg_next::software::resampling::Context::get(
-                                aframe.format(), src_layout, aframe.rate(),
-                                ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
-                                out_layout, out_rate,
-                            ).ok();
+                            // Kalau ring buffer kebetulan lagi penuh (jarang,
+                            // krn backpressure di atas), push_slice cuma
+                            // ngambil sebisanya & sisanya didrop -- gak
+                            // masalah, itu cuma beberapa ms sample doang.
+                            let _ = producer.push_slice(floats);
+                            shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
                         }
-                        if let Some(rs) = resampler.as_mut() {
-                            let mut resampled = ffmpeg_next::frame::Audio::empty();
-                            if rs.run(&aframe, &mut resampled).is_ok() {
-                                let n_samples = resampled.samples() * out_channels as usize;
-                                let raw = resampled.data(0);
-                                if raw.len() >= n_samples * 4 {
-                                    let floats: &[f32] = unsafe {
-                                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
-                                    };
-                                    if let Some(prod) = audio_producer.as_mut() {
-                                        // Kalau ring buffer kebetulan lagi penuh (jarang,
-                                        // krn backpressure di atas), push_slice cuma
-                                        // ngambil sebisanya & sisanya didrop -- gak
-                                        // masalah, itu cuma beberapa ms sample doang.
-                                        let _ = prod.push_slice(floats);
-                                        shared.audio_buffered_hint.store(prod.occupied_len(), Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                        }
-                        let _ = aframe.timestamp().unwrap_or(0) as f64 * atb; // dicadangkan buat resync halus kalau perlu nanti
                     }
                 }
             }
