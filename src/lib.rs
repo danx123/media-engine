@@ -869,6 +869,19 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     let mut applied_seek_seq: u64 = 0;
     let mut sent_eof = false;
 
+    // SATU iterator paket, dipakai berulang -- BUKAN dibikin baru tiap
+    // baca satu paket (`input_ctx.packets().next()` tiap iterasi loop).
+    // Pola lama itu warisan dari kode awal yang cuma dites buat pemakaian
+    // pendek/bounded (seek_frame/read_next_frame, paling banyak ratusan
+    // panggilan). Di sini dipanggil di loop tanpa henti selama BERMENIT-
+    // MENIT, bisa ratusan ribu kali -- kemungkinan besar itu yang bikin
+    // audio thread berhenti baca prematur (bug/limitasi internal iterator
+    // yang gak pernah ketauan di skala pemakaian sebelumnya).
+    // `Option` di sini biar gampang "dilepas" (di-None-in) pas mau seek --
+    // seek() butuh &mut input_ctx eksklusif, gak bisa dipinjem bareng
+    // sama iterator yang masih hidup.
+    let mut packet_iter = Some(input_ctx.packets());
+
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             break;
@@ -879,6 +892,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
         // auto-loop-restart) yang belom diterapin -- terapin sekarang.
         let current_seq = shared.seek_seq.load(Ordering::SeqCst);
         if current_seq != applied_seek_seq {
+            packet_iter = None; // lepas borrow dulu biar input_ctx bisa dipinjem buat seek()
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
             if input_ctx.seek(ts, ..ts).is_ok() {
@@ -888,6 +902,7 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                 shared.eof.store(false, Ordering::Relaxed);
                 sent_eof = false;
             }
+            packet_iter = Some(input_ctx.packets()); // iterator baru, mulai dari posisi abis seek
             applied_seek_seq = current_seq;
         }
 
@@ -897,10 +912,11 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                 // lagi paused, lalu geser clock persis ke pts frame itu --
                 // jadi get_frame() normal di sisi Python otomatis nemu &
                 // nampilin frame ini di tick berikutnya, gak perlu jalur
-                // spesial di get_frame().
+                // spesial di get_frame(). Blok ini bounded (maks 500x) dan
+                // jarang dipanggil, jadi tetep pakai iterator yang sama.
                 let mut produced = false;
                 for _ in 0..500 {
-                    let next_packet = input_ctx.packets().next();
+                    let next_packet = packet_iter.as_mut().and_then(|it| it.next());
                     let (stream, packet) = match next_packet {
                         Some(p) => p,
                         None => {
@@ -936,13 +952,17 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
             continue;
         }
 
-        let next_packet = input_ctx.packets().next();
+        let next_packet = packet_iter.as_mut().and_then(|it| it.next());
         let (stream, packet) = match next_packet {
             Some(p) => p,
             None => {
                 if !sent_eof {
                     let _ = vdecoder.send_eof();
                     sent_eof = true;
+                    eprintln!(
+                        "[media_engine] video thread nyampe EOF file fisik @ posisi ~{:.2}s",
+                        shared.position(),
+                    );
                 }
                 if shared.loop_enabled.load(Ordering::Relaxed) {
                     // Auto-restart: minta seek ke detik 0 lewat generation
@@ -1014,6 +1034,11 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
     let mut applied_seek_seq: u64 = 0;
     let mut sent_eof = false;
 
+    // Sama kayak video_decode_loop: SATU iterator, dipakai berulang, cuma
+    // dibikin ulang pas ada seek. Lihat comment lebih lengkap di
+    // video_decode_loop soal kenapa ini penting.
+    let mut packet_iter = Some(input_ctx.packets());
+
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             break;
@@ -1021,6 +1046,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
 
         let current_seq = shared.seek_seq.load(Ordering::SeqCst);
         if current_seq != applied_seek_seq {
+            packet_iter = None; // lepas borrow dulu biar input_ctx bisa dipinjem buat seek()
             let sec = *shared.seek_target.lock().unwrap();
             let ts = av_time_base_ts(sec);
             if input_ctx.seek(ts, ..ts).is_ok() {
@@ -1031,6 +1057,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                 shared.reset_clock(sec);
                 sent_eof = false;
             }
+            packet_iter = Some(input_ctx.packets());
             applied_seek_seq = current_seq;
         }
 
@@ -1044,7 +1071,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             continue;
         }
 
-        let next_packet = input_ctx.packets().next();
+        let next_packet = packet_iter.as_mut().and_then(|it| it.next());
         let (stream, packet) = match next_packet {
             Some(p) => p,
             None => {
@@ -1118,7 +1145,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
         }
         }
     }
-
+}
 
 fn scale_to_rgb(
     decoded: &ffmpeg_next::frame::Video,
