@@ -23,11 +23,21 @@ cpal = "0.15"
 # baliknya). Ring buffer SPSC gak butuh lock sama sekali buat push/pop.
 ringbuf = "0.4"
 
+# [BARU] FFT buat fitur FFT visualizer (analisa spektrum frekuensi real-time
+# dari buffer audio yang lagi diputer PlayerEngine, lihat viz_ring/get_spectrum).
+rustfft = "6.2"
+
+# [BARU] Dipakai buat paralelkan komputasi CPU-bound yang gampang di-chunk:
+# envelope waveform (RMS per-segmen) dan autocorrelation buat BPM detection.
+# Pattern-nya sama kayak modul audio cutter/tag editor -- rayon bikin ini
+# jalan multi-core tanpa perlu urus thread pool manual sendiri.
+rayon = "1.10"
+
 # Non-Windows (mis. lint/test lokal di Linux/macOS): ffmpeg-sys-next boleh
 # pakai feature "build"-nya sendiri buat compile FFmpeg dari source, karena
 # di situ TARGET == HOST jadi gak kena bug cross-compile target_os di bawah.
 [target.'cfg(not(windows))'.dependencies]
-ffmpeg-next = { version = "7.0", default-features = false, features = [
+ffmpeg-next = { version = "7.1", default-features = false, features = [
     "static",
     "build",
     "codec",
@@ -43,7 +53,7 @@ ffmpeg-next = { version = "7.0", default-features = false, features = [
 # manual di CI (lihat build.yml) dengan --target-os=mingw32 yang benar, lalu
 # ffmpeg-sys-next diarahkan ke situ lewat env var FFMPEG_DIR.
 [target.'cfg(windows)'.dependencies]
-ffmpeg-next = { version = "7.0", default-features = false, features = [
+ffmpeg-next = { version = "7.1", default-features = false, features = [
     "static",
     "codec",
     "format",
