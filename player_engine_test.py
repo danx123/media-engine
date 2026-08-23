@@ -16,18 +16,19 @@ Cara pake:
 import sys
 import os
 
-from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtCore import Qt, QTimer, QSettings, QThread, QObject, Signal, QPoint, Slot, QMetaObject
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QFileDialog, QMessageBox, QSizePolicy,
-    QCheckBox,
+    QCheckBox, QStyle, QStyleOptionSlider,
 )
 
 try:
-    from media_engine import PlayerEngine
+    from media_engine import PlayerEngine, VideoDecoder
 except ImportError as e:
     PlayerEngine = None
+    VideoDecoder = None
     _IMPORT_ERROR = e
 
 
@@ -37,6 +38,131 @@ def format_time(seconds: float) -> str:
         seconds = 0.0
     m, s = divmod(int(seconds), 60)
     return f"{m:02d}:{s:02d}"
+
+
+# ══════════════════════════════════════════════════════════
+# Hover thumbnail: worker thread + slider custom + popup
+# ══════════════════════════════════════════════════════════
+#
+# Pola threading-nya: ThumbnailRequester tinggal di MAIN thread, cuma
+# nampung 1 Signal buat "ngirim" request nyebrang ke worker thread (Qt
+# otomatis pakai queued connection krn beda thread affinity). ThumbnailWorker
+# di-moveToThread() ke QThread terpisah dan bikin VideoDecoder-nya SENDIRI di
+# situ -- terpisah total dari PlayerEngine yang lagi dipakai buat playback,
+# jadi hover-preview gak akan pernah nyenggol/ganggu decode thread player.
+#
+# VideoDecoder itu unsendable di sisi Rust (PyO3), artinya cuma boleh
+# diakses dari thread Python tempat dia dibikin. Karena kita bikin instance-nya
+# di dalam slot yang jalan DI worker thread (bukan di __init__ main thread),
+# syarat itu otomatis kepenuhin.
+
+class ThumbnailRequester(QObject):
+    """Proxy tipis yang tinggal di main thread. request_thumbnail cuma
+    dipakai buat ngirim sinyal ke worker -- gak ada logic di sini."""
+    request_thumbnail = Signal(int, float, QPoint)  # req_id, detik, posisi global cursor
+
+
+class ThumbnailWorker(QObject):
+    """Jalan di QThread sendiri. Buka VideoDecoder-nya sendiri (terpisah
+    dari PlayerEngine yang lagi playback) dan proses satu permintaan
+    seek_frame() per sinyal masuk."""
+    thumbnail_ready = Signal(int, float, QPoint, object)  # req_id, detik, posisi, np.ndarray|None
+
+    def __init__(self, path: str):
+        super().__init__()
+        self._path = path
+        self._decoder = None
+
+    def handle_request(self, req_id: int, second: float, global_pos: QPoint):
+        try:
+            if self._decoder is None:
+                self._decoder = VideoDecoder(self._path)
+            frame = self._decoder.seek_frame(second)
+        except Exception:
+            frame = None  # posisi susah didecode (mis. mepet EOF) -- gapapa, skip aja
+        self.thumbnail_ready.emit(req_id, second, global_pos, frame)
+
+    @Slot()
+    def cleanup(self):
+        """WAJIB dipanggil lewat QMetaObject.invokeMethod(..., Qt.BlockingQueuedConnection)
+        dari main thread, BUKAN dipanggil langsung. VideoDecoder di sisi
+        Rust itu "unsendable" -- objeknya cuma boleh disentuh (termasuk
+        di-drop) dari thread yang sama tempat dia dibikin. self._decoder
+        dibikin di handle_request() yang jalan DI THREAD WORKER INI (lewat
+        queued connection), jadi drop-nya juga harus kejadian di sini, bukan
+        di main thread pas main thread nge-null-in reference ke worker ini."""
+        self._decoder = None
+
+
+class HoverSeekSlider(QSlider):
+    """QSlider biasa + sinyal hover yang ngasih tau posisi WAKTU (bukan cuma
+    posisi piksel) yang lagi ditunjuk cursor, dipetakan lewat QStyle biar
+    akurat ngitung margin groove/handle (bukan sekadar x/width linear)."""
+    hovered = Signal(float, QPoint)  # fraksi 0.0-1.0, posisi global cursor
+    hover_ended = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setMouseTracking(True)  # biar mouseMoveEvent nembak tanpa tombol ditekan
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        frac = self._x_to_fraction(event.position().x())
+        if frac is not None:
+            self.hovered.emit(frac, event.globalPosition().toPoint())
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.hover_ended.emit()
+
+    def _x_to_fraction(self, x: float):
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+        handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        span = groove.width() - handle.width()
+        if span <= 0:
+            return None
+        pos = min(max(int(x) - groove.x() - handle.width() // 2, 0), span)
+        value = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), pos, span)
+        value_range = max(self.maximum() - self.minimum(), 1)
+        return (value - self.minimum()) / value_range
+
+
+class ThumbnailPopup(QWidget):
+    """Widget floating kecil, gak nyuri fokus, gak kena klik (transparan buat
+    mouse) -- muncul di atas cursor pas hover di seekbar."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.ToolTip | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            "background-color: #1c1c1c; border: 1px solid #555; border-radius: 4px;"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+        self.image_label = QLabel()
+        self.time_label = QLabel()
+        self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setStyleSheet("color: white; background: transparent; border: none;")
+        layout.addWidget(self.image_label)
+        layout.addWidget(self.time_label)
+
+    def show_thumbnail(self, pixmap: QPixmap, time_text: str, global_pos: QPoint):
+        self.image_label.setPixmap(pixmap)
+        self.time_label.setText(time_text)
+        self.adjustSize()
+
+        x = global_pos.x() - self.width() // 2
+        y = global_pos.y() - self.height() - 16
+        screen = QApplication.screenAt(global_pos) or self.screen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            x = max(geo.left(), min(x, geo.right() - self.width()))
+            y = max(geo.top(), y)
+        self.move(x, y)
+        self.show()
 
 
 class PlayerTestWindow(QMainWindow):
@@ -59,6 +185,20 @@ class PlayerTestWindow(QMainWindow):
                                           # -> QImage nampilin garbage/crash.
         self._is_seeking_by_user = False  # true selama slider lagi di-drag manual
         self._duration = 0.0
+
+        # ── State buat hover-thumbnail di seekbar ──
+        self.thumb_thread = QThread(self)
+        self.thumb_worker = None            # dibikin ulang tiap ganti file, lihat _start_thumbnail_worker
+        self.thumb_requester = ThumbnailRequester()
+        self._thumb_frame_buf = None        # nahan reference array thumbnail, sama alasannya kayak _current_frame_buf
+        self._is_hovering_seekbar = False
+        self._hover_request_id = 0          # buat buang hasil basi kalau ada request lebih baru nyusul
+        self._pending_hover_time = 0.0
+        self._pending_hover_pos = QPoint()
+        self._hover_debounce = QTimer(self)
+        self._hover_debounce.setSingleShot(True)
+        self._hover_debounce.setInterval(80)  # nunggu cursor "diem" dulu ~80ms sblm nembak request
+        self._hover_debounce.timeout.connect(self._request_thumbnail)
 
         self._build_ui()
 
@@ -95,13 +235,17 @@ class PlayerTestWindow(QMainWindow):
         # Slider posisi + label waktu
         seek_row = QHBoxLayout()
         self.time_label = QLabel("00:00 / 00:00")
-        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider = HoverSeekSlider(Qt.Horizontal)
         self.position_slider.setRange(0, 1000)  # dipetakan ke 0..duration
         self.position_slider.sliderPressed.connect(self._on_slider_pressed)
         self.position_slider.sliderReleased.connect(self._on_slider_released)
+        self.position_slider.hovered.connect(self._on_seekbar_hover)
+        self.position_slider.hover_ended.connect(self._on_seekbar_hover_end)
         seek_row.addWidget(self.position_slider, stretch=1)
         seek_row.addWidget(self.time_label)
         root.addLayout(seek_row)
+
+        self.thumbnail_popup = ThumbnailPopup(self)
 
         # Tombol transport
         btn_row = QHBoxLayout()
@@ -208,6 +352,7 @@ class PlayerTestWindow(QMainWindow):
 
         self.engine.play()
         self.tick_timer.start()
+        self._start_thumbnail_worker(path)
 
     # ────────────────────────────────────────────
     # Transport controls
@@ -264,6 +409,84 @@ class PlayerTestWindow(QMainWindow):
         self._is_seeking_by_user = False
 
     # ────────────────────────────────────────────
+    # Hover-thumbnail di seekbar
+    # ────────────────────────────────────────────
+
+    def _start_thumbnail_worker(self, path: str):
+        if VideoDecoder is None:
+            return  # media_engine gagal ke-import, sudah dikeluhin pas startup
+        self._stop_thumbnail_worker()
+
+        self.thumb_worker = ThumbnailWorker(path)
+        self.thumb_worker.moveToThread(self.thumb_thread)
+        self.thumb_requester.request_thumbnail.connect(self.thumb_worker.handle_request)
+        self.thumb_worker.thumbnail_ready.connect(self._on_thumbnail_ready)
+        self.thumb_thread.start()
+
+    def _stop_thumbnail_worker(self):
+        if self.thumb_worker is not None and self.thumb_thread.isRunning():
+            # BlockingQueuedConnection: manggil cleanup() dan NUNGGU sampe
+            # beneran kelar dieksekusi DI THREAD WORKER, sebelum kita lanjut.
+            # Ini yang nyegah crash "VideoDecoder is unsendable, but is
+            # being dropped on another thread" -- tanpa ini, VideoDecoder-nya
+            # baru ke-drop belakangan pas `self.thumb_worker = None` di
+            # bawah, yang jalan di MAIN thread (thread yang salah).
+            QMetaObject.invokeMethod(self.thumb_worker, "cleanup", Qt.BlockingQueuedConnection)
+            # deleteLater() (bukan langsung None) supaya QObject-nya sendiri
+            # juga dibersihin lewat event loop thread-nya sendiri, konsisten
+            # sama alasan yang sama di atas.
+            self.thumb_worker.deleteLater()
+        if self.thumb_thread.isRunning():
+            try:
+                self.thumb_requester.request_thumbnail.disconnect()
+            except TypeError:
+                pass  # belum ada koneksi sama sekali (mis. file pertama kali dibuka)
+            self.thumb_thread.quit()
+            self.thumb_thread.wait(1000)
+        self.thumb_worker = None
+
+    def _on_seekbar_hover(self, frac: float, global_pos: QPoint):
+        if self._duration <= 0 or VideoDecoder is None:
+            return
+        self._is_hovering_seekbar = True
+        self._pending_hover_time = frac * self._duration
+        self._pending_hover_pos = global_pos
+        self._hover_debounce.start()  # restart tiap gerak -- cuma nembak request pas cursor behenti sejenak
+
+    def _on_seekbar_hover_end(self):
+        self._is_hovering_seekbar = False
+        self._hover_debounce.stop()
+        self.thumbnail_popup.hide()
+
+    def _request_thumbnail(self):
+        if self.thumb_worker is None or not self._is_hovering_seekbar:
+            return
+        self._hover_request_id += 1
+        self.thumb_requester.request_thumbnail.emit(
+            self._hover_request_id, self._pending_hover_time, self._pending_hover_pos,
+        )
+
+    def _on_thumbnail_ready(self, req_id: int, requested_time: float, global_pos: QPoint, frame):
+        # Buang hasil basi: ada request lebih baru yang udah nyusul sebelum
+        # yang ini balik (misal cursor kepalang gerak lagi sebelum decode
+        # kelar) -- tanpa cek ini, thumbnail bisa "ngetril" nampilin posisi
+        # lama pas cursor udah pindah jauh.
+        if req_id != self._hover_request_id or not self._is_hovering_seekbar:
+            return
+        if frame is None:
+            return
+
+        h, w, _ = frame.shape
+        self._thumb_frame_buf = frame  # tahan reference selama QImage masih makenya
+        image = QImage(frame.data, w, h, w * 3, QImage.Format_RGB888)
+        thumb_w = 160
+        thumb_h = max(1, int(thumb_w * h / w))
+        pixmap = QPixmap.fromImage(image).scaled(
+            thumb_w, thumb_h, Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.thumbnail_popup.show_thumbnail(pixmap, format_time(requested_time), global_pos)
+
+    # ────────────────────────────────────────────
     # Loop utama — dipanggil tiap TICK_MS
     # ────────────────────────────────────────────
 
@@ -310,6 +533,7 @@ class PlayerTestWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.tick_timer.stop()
+        self._stop_thumbnail_worker()
         if self.engine is not None:
             self.engine.close()
             self.engine = None
