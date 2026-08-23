@@ -32,11 +32,10 @@ fn init_ffmpeg() -> PyResult<()> {
 
 // Input::seek() di ffmpeg-next dipanggil dengan stream_index = -1 di
 // belakang layar (avformat_seek_file). Kalau stream_index = -1, FFmpeg
-// nganggep timestamp yang dikasih itu dalam satuan AV_TIME_BASE
-// (mikrodetik / 1_000_000), BUKAN time_base stream video. Ini beda sama
-// yang dipakai di VideoDecoder lama (yang salah pakai time_base stream) —
-// gak dibenerin di situ biar VideoDecoder lama tetep stabil buat thumbnail,
-// tapi PlayerEngine di bawah pakai yang bener.
+// nganggep timestamp yang dikasih dalam satuan AV_TIME_BASE (mikrodetik /
+// 1_000_000), BUKAN time_base stream video. Dipakai di PlayerEngine
+// (video/audio_decode_loop) MAUPUN VideoDecoder::seek_frame -- keduanya
+// sama-sama manggil Input::seek() jadi sama-sama butuh konversi ini.
 fn av_time_base_ts(seconds: f64) -> i64 {
     (seconds * 1_000_000.0) as i64
 }
@@ -161,8 +160,22 @@ impl VideoDecoder {
     }
 
     fn seek_frame(&mut self, py: Python<'_>, second: f64) -> PyResult<Py<PyArray3<u8>>> {
+        // BUG LAMA (sekarang dibenerin): input_ctx.seek() di ffmpeg-next
+        // manggil avformat_seek_file dengan stream_index = -1 di baliknya,
+        // yang artinya timestamp yang dikasih ke seek() itu HARUS dalam
+        // satuan AV_TIME_BASE (mikrodetik / 1_000_000), BUKAN time_base
+        // stream video. Sebelumnya kode ini pakai `second / self.time_base`
+        // buat DUA hal sekaligus (parameter seek() DAN pembanding
+        // decoded.timestamp()) -- padahal keduanya butuh satuan yang beda.
+        // Efeknya: seek() lompat ke posisi yang salah total di file (bisa
+        // jauh sebelum/sesudah yang dimaksud tergantung time_base-nya),
+        // terus loop pencarian di bawah gagal nemuin frame yang match dalam
+        // 200 paket -> "Bingkai tidak ditemukan". target_ts (buat
+        // dibandingin ke decoded.timestamp()) tetep harus di time_base
+        // stream, itu gak berubah -- yang salah cuma parameter ke seek().
+        let seek_ts = av_time_base_ts(second);
         let target_ts = (second / self.time_base).round() as i64;
-        self.input_ctx.seek(target_ts, ..target_ts)
+        self.input_ctx.seek(seek_ts, ..seek_ts)
             .map_err(|e| PyRuntimeError::new_err(format!("Lompat gagal: {}", e)))?;
         self.decoder.flush();
 
@@ -524,7 +537,7 @@ impl PlayerEngine {
                         // persis gejala "video-audio kerasa ada jeda" yang
                         // nempel terus sepanjang playback. Stream ini baru
                         // beneran di-play() pas play()/seek() Python dipanggil,
-                        // sesudah buffer di-priming (lihat prime_audio_buffer).
+                        // sesudah buffer di-priming (lihat wait_for_seek_ready).
                         let _ = stream.pause();
                         audio_stream = Some(stream);
                         audio_producer = Some(producer);
@@ -587,11 +600,12 @@ impl PlayerEngine {
     /// Mulai/lanjutkan playback.
     fn play(&mut self) {
         if !self.shared.playing.swap(true, Ordering::SeqCst) {
-            // Tunggu buffer keisi cukup DULU sebelum stream cpal beneran
-            // dibuka, biar begitu kebunyi langsung isi asli -- bukan
-            // silence yang ngasih clock keburu maju (lihat catatan di
-            // constructor soal kenapa stream gak langsung di-play di sana).
-            self.prime_audio_buffer();
+            // Tunggu AUDIO dan VIDEO dua2nya siap sebelum stream cpal
+            // beneran dibuka. Lihat wait_for_seek_ready() -- ini juga yang
+            // nyegah audio "kabur duluan" ninggalin video pas video masih
+            // proses nyiapin frame pertama.
+            let target = self.shared.position();
+            self.wait_for_seek_ready(target);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
@@ -660,12 +674,14 @@ impl PlayerEngine {
     }
 
     /// Lompat ke detik tertentu. Kalau lagi playing, audio stream dipause
-    /// sesaat sementara nunggu decode thread ngisi ulang buffer pasca-seek
-    /// (yg otomatis dikosongin) -- kalau nggak, sama kayak masalah di
-    /// play(): stream bakal narik buffer kosong dan clock keburu maju
-    /// duluan sebelum ada suara baru yg beneran kebunyi, bikin drift kecil
-    /// tiap abis seek. Kalau lagi paused, gak ada yang perlu ditunggu
-    /// (stream emang udah diem).
+    /// sesaat sementara nunggu KEDUANYA (audio dan video) siap lagi di
+    /// posisi baru. Audio biasanya seek hampir instan, tapi video harus
+    /// nyari keyframe terdekat dulu baru "ngejar" maju ke target -- itu
+    /// bisa makan waktu jauh lebih lama drpd audio. Kalau cuma nunggu audio
+    /// doang (seperti sebelumnya), begitu resume, audio langsung jalan dari
+    /// posisi target sementara video masih proses ngejar -- kerasa "audio
+    /// duluan drpd video". Kalau lagi paused, gak ada yang perlu ditunggu
+    /// (stream emang udah diem, dan Python nunggu next tick apa adanya).
     fn seek(&mut self, second: f64) {
         let was_playing = self.shared.playing.load(Ordering::Relaxed);
         if was_playing {
@@ -679,7 +695,7 @@ impl PlayerEngine {
         self.shared.seek_seq.fetch_add(1, Ordering::SeqCst);
 
         if was_playing {
-            self.prime_audio_buffer();
+            self.wait_for_seek_ready(second);
             if let Some(stream) = self._audio_stream.as_ref() {
                 let _ = stream.play();
             }
@@ -766,22 +782,36 @@ impl PlayerEngine {
 /// Helper internal -- sengaja dipisah dari blok #[pymethods] di atas
 /// biar gak ikut ke-expose sebagai method Python.
 impl PlayerEngine {
-    /// Tunggu (dibatasi ~300ms) sampe ring buffer audio keisi minimal ~150ms sample
-    /// baru, sebelum stream cpal beneran dibuka/dibuka-lagi. Dipanggil dari
-    /// play() dan seek() -- keduanya sama-sama titik rawan stream narik
-    /// buffer kosong dan bikin clock maju duluan drpd suara aslinya.
-    /// Timeout ada biar UI gak nge-hang selamanya kalau misal decode
-    /// thread lambat start atau macet.
-    fn prime_audio_buffer(&self) {
-        if !self.has_audio {
-            return;
-        }
+    /// Tunggu (dibatasi ~400ms) sampe AUDIO dan VIDEO dua2nya siap di
+    /// sekitar posisi `target`, sebelum stream audio beneran
+    /// dibuka/dibuka-lagi. Dipanggil dari play() dan seek().
+    ///
+    /// - Audio dianggap siap kalau ring buffer-nya udah keisi ~150ms sample.
+    /// - Video dianggap siap kalau frame TERBARU yang udah didecode
+    ///   (q.back(), bukan q.front() -- back() nunjukkin sejauh mana decode
+    ///   udah "nyampe", front() cuma frame paling lama yg masih ngendon)
+    ///   udah nyampe/lewatin target. Video butuh ini krn abis seek dia
+    ///   harus nyari keyframe dulu baru ngejar maju ke target -- proses itu
+    ///   ambil waktu jauh lebih lama drpd audio yang seek-nya nyaris instan.
+    ///
+    /// Tanpa nunggu video juga, audio bakal mulai bunyi duluan begitu
+    /// buffer-nya siap, ninggalin video yang masih proses ngejar -- kerasa
+    /// "audio duluan drpd video" tiap abis play()/seek(). Timeout ada biar
+    /// UI gak nge-hang selamanya kalau video-nya lambat/macet.
+    fn wait_for_seek_ready(&self, target: f64) {
         let sr = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as usize;
         let ch = self.shared.out_channels.load(Ordering::Relaxed).max(1) as usize;
-        let target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
-        let deadline = Instant::now() + Duration::from_millis(300);
+        let audio_target = (sr * ch) / 7; // ~150ms readahead sebelum mulai bunyi
+        let deadline = Instant::now() + Duration::from_millis(400);
+
         while Instant::now() < deadline {
-            if self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= target {
+            let audio_ready = !self.has_audio
+                || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
+            let video_ready = {
+                let q = self.shared.video_q.lock().unwrap();
+                q.back().map(|f| f.pts + 0.05 >= target).unwrap_or(false)
+            };
+            if audio_ready && video_ready {
                 return;
             }
             thread::sleep(Duration::from_millis(5));
@@ -1021,6 +1051,10 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                 if !sent_eof {
                     let _ = adecoder.send_eof();
                     sent_eof = true;
+                    eprintln!(
+                        "[media_engine] audio thread nyampe EOF file fisik @ posisi ~{:.2}s (kalau ini muncul jauh sebelum durasi video abis, kemungkinan track audio di file emang lebih pendek drpd video, bukan bug decode)",
+                        shared.position(),
+                    );
                 }
                 // EOF di sisi audio gak nge-trigger apa2 (bukan yg megang
                 // status "selesai" buat UI, itu video_decode_loop). Kalau
@@ -1035,23 +1069,33 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             continue;
         }
 
-        if adecoder.send_packet(&packet).is_ok() {
-            while adecoder.receive_frame(&mut aframe).is_ok() {
-                if resampler.is_none() {
-                    let src_layout = if aframe.channel_layout().bits() != 0 {
-                        aframe.channel_layout()
-                    } else {
-                        ffmpeg_next::util::channel_layout::ChannelLayout::default(adecoder.channels() as i32)
-                    };
-                    resampler = ffmpeg_next::software::resampling::Context::get(
-                        aframe.format(), src_layout, aframe.rate(),
-                        ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
-                        out_layout, out_rate,
-                    ).ok();
-                }
-                if let Some(rs) = resampler.as_mut() {
-                    let mut resampled = ffmpeg_next::frame::Audio::empty();
-                    if rs.run(&aframe, &mut resampled).is_ok() {
+        if let Err(e) = adecoder.send_packet(&packet) {
+            eprintln!("[media_engine] audio send_packet gagal @ ~{:.2}s: {e}", shared.position());
+            continue;
+        }
+        while adecoder.receive_frame(&mut aframe).is_ok() {
+            if resampler.is_none() {
+                let src_layout = if aframe.channel_layout().bits() != 0 {
+                    aframe.channel_layout()
+                } else {
+                    ffmpeg_next::util::channel_layout::ChannelLayout::default(adecoder.channels() as i32)
+                };
+                resampler = match ffmpeg_next::software::resampling::Context::get(
+                    aframe.format(), src_layout, aframe.rate(),
+                    ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+                    out_layout, out_rate,
+                ) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        eprintln!("[media_engine] gagal bikin audio resampler: {e}");
+                        None
+                    }
+                };
+            }
+            if let Some(rs) = resampler.as_mut() {
+                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                match rs.run(&aframe, &mut resampled) {
+                    Ok(_) => {
                         let n_samples = resampled.samples() * out_channels as usize;
                         let raw = resampled.data(0);
                         if raw.len() >= n_samples * 4 {
@@ -1066,8 +1110,12 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                             shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
                         }
                     }
+                    Err(e) => {
+                        eprintln!("[media_engine] resample audio gagal @ ~{:.2}s: {e}", shared.position());
+                    }
                 }
             }
+        }
         }
     }
 }
