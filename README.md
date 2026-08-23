@@ -10,7 +10,8 @@ Python remains the primary language across Macan Angkasa. `media_engine` (and it
 
 ## Features
 
-- **`MediaInfo`** — Fast metadata probe (duration, resolution, fps, codec, bitrate) without decoding frames.
+- **`MediaInfo`** — Fast metadata probe of the video stream (duration, resolution, fps, codec, bitrate) without decoding frames.
+- **`AudioInfo`** — Fast metadata probe of the audio stream (codec, sample rate, channels, bitrate) without decoding samples. Replaces spawning `ffprobe` for this purpose — no subprocess, no timeout to wait out.
 - **`VideoDecoder`** — Single-frame seek/decode, primarily used for one-off thumbnails (e.g. seek-frame preview in a scrubber).
 - **`PlayerEngine`** — Full playback engine driving synchronized video + audio decode threads:
   - Play / pause / stop / step-frame / seek / loop
