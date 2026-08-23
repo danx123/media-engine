@@ -15,6 +15,14 @@ ndarray = "0.15"
 # butuh `libasound2-dev` kepasang di mesin coding.
 cpal = "0.15"
 
+# [BARU] Ring buffer SPSC lock-free buat nampung sample audio antara decode
+# thread (producer) dan callback audio cpal (consumer). Sebelumnya pakai
+# Mutex<VecDeque<f32>>, tapi Mutex yang dikunci dari REAL-TIME audio
+# callback rawan bikin glitch/krek-krek kalau kebetulan lagi dipegang decode
+# thread pas callback butuh jalan (apalagi kalau sampe ada realokasi Vec di
+# baliknya). Ring buffer SPSC gak butuh lock sama sekali buat push/pop.
+ringbuf = "0.4"
+
 # Non-Windows (mis. lint/test lokal di Linux/macOS): ffmpeg-sys-next boleh
 # pakai feature "build"-nya sendiri buat compile FFmpeg dari source, karena
 # di situ TARGET == HOST jadi gak kena bug cross-compile target_os di bawah.
