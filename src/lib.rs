@@ -124,6 +124,83 @@ impl MediaInfo {
     }
 }
 
+// [BARU] Metadata stream AUDIO (codec/sample-rate/channels/bitrate), baca
+// dari header file doang -- gak decode sample apapun. Sengaja dipisah dari
+// MediaInfo (yang cuma probe stream video) drpd nambahin field audio ke
+// situ, biar caller yang cuma butuh video (mis. VideoDecoder/seek_frame)
+// gak ikut kena biaya probe stream audio yang gak dia pakai.
+//
+// Dipakai buat gantiin subprocess `ffprobe` di panel Properties Macan
+// Video Player (lihat _PropertiesMetaWorker._probe_audio_info di
+// macan_context.py) -- ffprobe punya timeout sampai 8 detik dan nge-spawn
+// proses baru tiap panggilan, AudioInfo baca langsung dari header lewat
+// binding yang udah ke-link di proses yang sama.
+#[pyclass]
+struct AudioInfo {
+    #[pyo3(get)] path: String,
+    #[pyo3(get)] codec: String,
+    #[pyo3(get)] codec_id: String,
+    #[pyo3(get)] sample_rate: u32,
+    #[pyo3(get)] channels: u32,
+    #[pyo3(get)] bitrate: i64,
+}
+
+#[pymethods]
+impl AudioInfo {
+    #[new]
+    fn new(file_path: &str) -> PyResult<Self> {
+        init_ffmpeg()?;
+
+        let path = Path::new(file_path);
+        let input = ffmpeg_next::format::input(&path)
+            .map_err(|e| PyIOError::new_err(format!("Buka file: {}", e)))?;
+
+        let stream = input.streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .ok_or_else(|| PyValueError::new_err("Tidak ada aliran audio"))?;
+
+        let id = stream.parameters().id();
+        let codec_id = id.name().to_string();
+        let codec = ffmpeg_next::codec::decoder::find(id)
+            .map(|c| c.description().to_string())
+            .unwrap_or_else(|| "Tidak diketahui".to_string());
+
+        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
+
+        // Bit rate per-stream (AVCodecParameters.bit_rate lewat AVCodecContext)
+        // -- HARUS dibaca dari `ctx` di sini, SEBELUM `ctx.decoder()` di bawah
+        // (itu consume `ctx`). Kalau nanti `cargo check` komplen method ini
+        // gak ada di versi ffmpeg-next yang kepasang, cek `cargo doc --open
+        // -p ffmpeg-next` -> `codec::context::Context` buat nama method yang
+        // benar (mirip pattern encoder.set_bit_rate() yang dipakai di BAGIAN 5).
+        let ctx_bitrate = ctx.bit_rate() as i64;
+
+        let adec = ctx.decoder().audio()
+            .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder audio: {}", e)))?;
+
+        let sample_rate = adec.rate();
+        let channels = adec.channels() as u32;
+
+        // Fallback ke bitrate container kalau per-stream-nya gak ke-isi
+        // (kejadian di beberapa container/codec yang gak nyimpen bit_rate
+        // eksplisit di codec parameters-nya).
+        let bitrate = if ctx_bitrate > 0 { ctx_bitrate } else { input.bit_rate() };
+
+        Ok(AudioInfo {
+            path: file_path.to_string(),
+            codec, codec_id, sample_rate, channels, bitrate,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AudioInfo({}, {} {}Hz {}ch, bitrate={}bps)",
+            self.codec_id, self.codec, self.sample_rate, self.channels, self.bitrate
+        )
+    }
+}
+
 // ═══════════════════════════════════════════════
 // BAGIAN 2: DEKODER BINGKAI TUNGGAL (dipertahankan apa adanya
 // untuk kebutuhan seek-frame / thumbnail. Player beneran pakai
@@ -2329,6 +2406,7 @@ fn analyze_loudness(file_path: &str) -> PyResult<(f32, f32)> {
 #[pymodule]
 fn media_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MediaInfo>()?;
+    m.add_class::<AudioInfo>()?;
     m.add_class::<VideoDecoder>()?;
     m.add_class::<PlayerEngine>()?;
     m.add_function(wrap_pyfunction!(analyze_waveform, m)?)?;
