@@ -16,7 +16,7 @@ use ringbuf::traits::{Consumer as _, Observer as _, Producer as _, Split as _};
 // (chunk-chunk independen -> gampang di-`par_iter()`-in, gak butuh thread
 // pool manual). rustfft buat fungsi FFT visualizer (spectrum analyzer).
 use rayon::prelude::*;
-use rustfft::{FftPlanner, num_complex::Complex32};
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 // Alias biar gampang disesuaikan kalau nama tipe exact-nya beda dikit di
 // versi `ringbuf` yang kepasang (API crate ini sempat berubah antar versi
@@ -1715,6 +1715,79 @@ fn analyze_waveform(py: Python<'_>, file_path: &str, target_points: usize) -> Py
     Ok((arr.into_pyarray(py).into(), bpm))
 }
 
+/// [BARU] Expose `decode_audio_mono` langsung ke Python -- gantiin
+/// subprocess `ffmpeg -f s16le pipe:1` yang sebelumnya dipakai AudioLoader
+/// di macan_visualizer.py buat decode seluruh track ke PCM sebelum di-FFT.
+/// Balikin array float32 mono ternormalisasi [-1.0..1.0], sudah di-resample
+/// ke `out_rate`. Satu proses (gak spawn subprocess baru), jadi gak perlu
+/// lagi cari-cari path ffmpeg statis/bundled/PATH sistem di sisi Python.
+#[pyfunction]
+fn decode_audio(py: Python<'_>, file_path: &str, out_rate: u32) -> PyResult<Py<PyArray1<f32>>> {
+    let samples = decode_audio_mono(file_path, out_rate)?;
+    let arr = Array1::from_vec(samples);
+    Ok(arr.into_pyarray(py).into())
+}
+
+/// [BARU] Analisa spektrum FFT untuk chunk sample sembarang -- dipakai
+/// AudioVisualizer di macan_visualizer.py buat bar/wave visualizer + deteksi
+/// bass level (BreathableArtwork). Gantiin crate `macan_fft` yang tadinya
+/// berdiri sendiri, sekarang jadi bagian dari media_engine biar cuma satu
+/// binary native yang perlu di-maintain/di-build.
+///
+/// API sengaja dibikin kompatibel 1:1 sama `macan_fft.MacanFft` lama:
+/// constructor `SpectrumAnalyzer(fft_size)` (fft_size harus pangkat 2),
+/// method `.compute(samples)` -> magnitude LINEAR (bukan dB, beda dengan
+/// PlayerEngine.get_spectrum() yang memang didesain buat tampilan dB),
+/// panjang fft_size//2+1, window Hanning sudah diterapkan di dalam
+/// compute() jadi caller Python TIDAK perlu windowing manual lagi.
+#[pyclass]
+struct SpectrumAnalyzer {
+    fft_size: usize,
+    window: Vec<f32>,
+    fft: Arc<dyn Fft<f32>>,
+}
+
+#[pymethods]
+impl SpectrumAnalyzer {
+    #[new]
+    fn new(fft_size: usize) -> PyResult<Self> {
+        if fft_size == 0 || (fft_size & (fft_size - 1)) != 0 {
+            return Err(PyValueError::new_err("fft_size harus pangkat 2 (mis. 512, 1024, 2048)"));
+        }
+        // Precompute window Hanning & rencana FFT sekali di constructor --
+        // sama seperti strategi macan_fft lama, biar gak dihitung ulang
+        // tiap panggilan .compute() (dipanggil ~50x/detik di visualizer).
+        let window: Vec<f32> = (0..fft_size).map(|i| {
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos()
+        }).collect();
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        Ok(SpectrumAnalyzer { fft_size, window, fft })
+    }
+
+    fn compute(&self, py: Python<'_>, samples: Vec<f32>) -> PyResult<Py<PyArray1<f32>>> {
+        if samples.len() != self.fft_size {
+            return Err(PyValueError::new_err(format!(
+                "Jumlah sample ({}) harus sama dengan fft_size ({})",
+                samples.len(), self.fft_size
+            )));
+        }
+
+        let mut buf: Vec<Complex32> = samples.iter().zip(self.window.iter())
+            .map(|(&s, &w)| Complex32::new(s * w, 0.0))
+            .collect();
+        self.fft.process(&mut buf);
+
+        // Sinyal input real -> spektrum Hermitian-symmetric, cuma
+        // fft_size//2+1 bin pertama yang unik (sama seperti np.fft.rfft
+        // dulu di macan_fft/fallback numpy).
+        let half = self.fft_size / 2 + 1;
+        let magnitude: Vec<f32> = buf[..half].iter().map(|c| c.norm()).collect();
+        let arr = Array1::from_vec(magnitude);
+        Ok(arr.into_pyarray(py).into())
+    }
+}
+
 // ═══════════════════════════════════════════════
 // BAGIAN 5: KONVERTER AUDIO/VIDEO -- transcode/remux native lewat
 // ffmpeg-next, gantiin subprocess ffmpeg.exe (kayak yang dipakai Macan
@@ -2408,9 +2481,11 @@ fn media_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioInfo>()?;
     m.add_class::<VideoDecoder>()?;
     m.add_class::<PlayerEngine>()?;
+    m.add_class::<SpectrumAnalyzer>()?;
     m.add_function(wrap_pyfunction!(analyze_waveform, m)?)?;
     m.add_function(wrap_pyfunction!(convert_media, m)?)?;
     m.add_function(wrap_pyfunction!(generate_thumbnails, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_loudness, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_audio, m)?)?;
     Ok(())
 }
