@@ -168,19 +168,18 @@ impl AudioInfo {
         let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
 
-        // Bit rate per-stream (AVCodecParameters.bit_rate lewat AVCodecContext)
-        // -- HARUS dibaca dari `ctx` di sini, SEBELUM `ctx.decoder()` di bawah
-        // (itu consume `ctx`). Kalau nanti `cargo check` komplen method ini
-        // gak ada di versi ffmpeg-next yang kepasang, cek `cargo doc --open
-        // -p ffmpeg-next` -> `codec::context::Context` buat nama method yang
-        // benar (mirip pattern encoder.set_bit_rate() yang dipakai di BAGIAN 5).
-        let ctx_bitrate = ctx.bit_rate() as i64;
-
         let adec = ctx.decoder().audio()
             .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder audio: {}", e)))?;
 
         let sample_rate = adec.rate();
         let channels = adec.channels() as u32;
+
+        // [FIX] `codec::context::Context` (si `ctx` sebelum `.decoder()`) gak
+        // punya method `bit_rate()` di ffmpeg-next 7.x -- itu cuma exist di
+        // `codec::decoder::Opened` (lewat Deref-nya `Audio`/`Video`), jadi
+        // HARUS dibaca dari `adec` di sini, SETELAH decoder-nya jadi, bukan
+        // dari `ctx` sebelum `.decoder()` seperti sebelumnya.
+        let ctx_bitrate = adec.bit_rate() as i64;
 
         // Fallback ke bitrate container kalau per-stream-nya gak ke-isi
         // (kejadian di beberapa container/codec yang gak nyimpen bit_rate
