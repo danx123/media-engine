@@ -959,8 +959,21 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                 if !sent_eof {
                     let _ = vdecoder.send_eof();
                     sent_eof = true;
+                    // [FIX] Sama kayak audio_decode_loop: abis send_eof(),
+                    // decoder masuk mode draining -- WAJIB terus manggil
+                    // receive_frame() buat ngeluarin sisa frame yg masih
+                    // ke-buffer internal (B-frame reorder/decode delay).
+                    // Sebelumnya ini gak dipanggil -> beberapa frame
+                    // terakhir video ilang juga (gak seketara audio krn gak
+                    // ada log-nya, tapi bug-nya sama persis).
+                    while vdecoder.receive_frame(&mut vframe).is_ok() {
+                        let pts = vframe.timestamp().unwrap_or(0) as f64 * vtb;
+                        if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                            shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                        }
+                    }
                     eprintln!(
-                        "[media_engine] video thread nyampe EOF file fisik @ posisi ~{:.2}s",
+                        "[media_engine] video thread nyampe EOF file fisik (udah di-drain) @ posisi ~{:.2}s",
                         shared.position(),
                     );
                 }
@@ -999,6 +1012,69 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
 /// nyentuh video_q -- itu urusan video_decode_loop(). Backpressure &
 /// seek-nya independen total dari video, jadi video yang lagi berat gak
 /// akan pernah bisa bikin thread ini (dan ring buffer-nya) ke-block.
+///
+/// Helper: resample SATU frame audio hasil decode -> push ke ring buffer.
+/// Dipisah dari loop utama (BUKAN cuma dipanggil sekali) karena dipanggil
+/// dari DUA tempat: (1) jalur normal abis receive_frame() dalem loop paket,
+/// (2) jalur drain abis send_eof() -- FFmpeg codec kayak AAC/Opus sering
+/// nahan beberapa frame di buffer internal (decode delay/reorder), dan itu
+/// CUMA keluar via receive_frame() lagi SETELAH send_eof() dipanggil.
+/// Sebelumnya jalur (2) ini gak ada sama sekali -> sample-sample terakhir
+/// yang masih ke-buffer di decoder ilang gitu aja, bikin audio berhenti
+/// sebelum video abis walau track audio-nya sebenernya sama panjang.
+fn push_resampled_audio_frame(
+    aframe: &ffmpeg_next::frame::Audio,
+    resampler: &mut Option<ffmpeg_next::software::resampling::Context>,
+    producer: &mut AudioProducer,
+    shared: &Shared,
+    decoder_channels: i32,
+    out_layout: ffmpeg_next::util::channel_layout::ChannelLayout,
+    out_rate: u32,
+    out_channels: u16,
+) {
+    if resampler.is_none() {
+        let src_layout = if aframe.channel_layout().bits() != 0 {
+            aframe.channel_layout()
+        } else {
+            ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder_channels)
+        };
+        *resampler = match ffmpeg_next::software::resampling::Context::get(
+            aframe.format(), src_layout, aframe.rate(),
+            ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+            out_layout, out_rate,
+        ) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("[media_engine] gagal bikin audio resampler: {e}");
+                None
+            }
+        };
+    }
+    if let Some(rs) = resampler.as_mut() {
+        let mut resampled = ffmpeg_next::frame::Audio::empty();
+        match rs.run(aframe, &mut resampled) {
+            Ok(_) => {
+                let n_samples = resampled.samples() * out_channels as usize;
+                let raw = resampled.data(0);
+                if raw.len() >= n_samples * 4 {
+                    let floats: &[f32] = unsafe {
+                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
+                    };
+                    // Kalau ring buffer kebetulan lagi penuh (jarang, krn
+                    // backpressure di atas), push_slice cuma ngambil
+                    // sebisanya & sisanya didrop -- gak masalah, itu cuma
+                    // beberapa ms sample doang.
+                    let _ = producer.push_slice(floats);
+                    shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                eprintln!("[media_engine] resample audio gagal @ ~{:.2}s: {e}", shared.position());
+            }
+        }
+    }
+}
+
 fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: AudioProducer) {
     let path = Path::new(&file_path);
     let mut input_ctx = match ffmpeg_next::format::input(&path) {
@@ -1078,8 +1154,24 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                 if !sent_eof {
                     let _ = adecoder.send_eof();
                     sent_eof = true;
+                    // [FIX] send_eof() naruh decoder ke mode "draining" --
+                    // WAJIB terus manggil receive_frame() sampe dia gak
+                    // ngasih frame lagi, buat ngeluarin sisa frame yg masih
+                    // ke-buffer internal (decode delay/reorder, umum di
+                    // AAC/Opus dll). Sebelumnya ini gak dipanggil sama
+                    // sekali abis send_eof() -- makanya audio berhenti
+                    // KEDENGERAN lebih awal drpd posisi EOF fisik yang
+                    // dilog di bawah (buffer di ring buffer, yg diisi dari
+                    // sample2 sebelum EOF, keburu abis sebelum sample2 sisa
+                    // hasil drain ini nyampe -- padahal seharusnya ada).
+                    while adecoder.receive_frame(&mut aframe).is_ok() {
+                        push_resampled_audio_frame(
+                            &aframe, &mut resampler, &mut producer, &shared,
+                            adecoder.channels() as i32, out_layout, out_rate, out_channels,
+                        );
+                    }
                     eprintln!(
-                        "[media_engine] audio thread nyampe EOF file fisik @ posisi ~{:.2}s (kalau ini muncul jauh sebelum durasi video abis, kemungkinan track audio di file emang lebih pendek drpd video, bukan bug decode)",
+                        "[media_engine] audio thread nyampe EOF file fisik (udah di-drain) @ posisi ~{:.2}s (kalau ini muncul jauh sebelum durasi video abis, kemungkinan track audio di file emang lebih pendek drpd video, bukan bug decode)",
                         shared.position(),
                     );
                 }
@@ -1101,49 +1193,12 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             continue;
         }
         while adecoder.receive_frame(&mut aframe).is_ok() {
-            if resampler.is_none() {
-                let src_layout = if aframe.channel_layout().bits() != 0 {
-                    aframe.channel_layout()
-                } else {
-                    ffmpeg_next::util::channel_layout::ChannelLayout::default(adecoder.channels() as i32)
-                };
-                resampler = match ffmpeg_next::software::resampling::Context::get(
-                    aframe.format(), src_layout, aframe.rate(),
-                    ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
-                    out_layout, out_rate,
-                ) {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        eprintln!("[media_engine] gagal bikin audio resampler: {e}");
-                        None
-                    }
-                };
-            }
-            if let Some(rs) = resampler.as_mut() {
-                let mut resampled = ffmpeg_next::frame::Audio::empty();
-                match rs.run(&aframe, &mut resampled) {
-                    Ok(_) => {
-                        let n_samples = resampled.samples() * out_channels as usize;
-                        let raw = resampled.data(0);
-                        if raw.len() >= n_samples * 4 {
-                            let floats: &[f32] = unsafe {
-                                std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
-                            };
-                            // Kalau ring buffer kebetulan lagi penuh (jarang,
-                            // krn backpressure di atas), push_slice cuma
-                            // ngambil sebisanya & sisanya didrop -- gak
-                            // masalah, itu cuma beberapa ms sample doang.
-                            let _ = producer.push_slice(floats);
-                            shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[media_engine] resample audio gagal @ ~{:.2}s: {e}", shared.position());
-                    }
-                }
-            }
+            push_resampled_audio_frame(
+                &aframe, &mut resampler, &mut producer, &shared,
+                adecoder.channels() as i32, out_layout, out_rate, out_channels,
+            );
         }
-        }
+    }
     }
 
 
