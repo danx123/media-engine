@@ -78,7 +78,8 @@ class ThumbnailWorker(QObject):
             if self._decoder is None:
                 self._decoder = VideoDecoder(self._path)
             frame = self._decoder.seek_frame(second)
-        except Exception:
+        except Exception as e:
+            print(f"[ThumbnailWorker] gagal ambil frame @ {second:.2f}s: {e}")
             frame = None  # posisi susah didecode (mis. mepet EOF) -- gapapa, skip aja
         self.thumbnail_ready.emit(req_id, second, global_pos, frame)
 
@@ -107,7 +108,17 @@ class HoverSeekSlider(QSlider):
 
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
-        frac = self._x_to_fraction(event.position().x())
+        # PENTING: exception yang kelempar dari dalam mouseMoveEvent (method
+        # virtual yang dipanggil dari sisi C++ Qt) BISA KETELAN DIAM-DIAM --
+        # gak selalu muncul sebagai traceback normal di console, tergantung
+        # excepthook yang aktif. Makanya dibungkus try/except eksplisit +
+        # print, biar kalau ada apa2 minimal kelihatan, bukan cuma "hover
+        # gak jalan" tanpa jejak sama sekali.
+        try:
+            frac = self._x_to_fraction(event.position().x())
+        except Exception as e:
+            print(f"[HoverSeekSlider] gagal hitung posisi hover: {e}")
+            return
         if frac is not None:
             self.hovered.emit(frac, event.globalPosition().toPoint())
 
@@ -118,8 +129,18 @@ class HoverSeekSlider(QSlider):
     def _x_to_fraction(self, x: float):
         opt = QStyleOptionSlider()
         self.initStyleOption(opt)
-        groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
-        handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+        style = self.style()
+        # Pakai bentuk SCOPED (QStyle.ComplexControl.xxx / QStyle.SubControl.xxx),
+        # bukan bentuk flat (QStyle.CC_Slider) -- di sebagian versi PySide6/Qt6,
+        # enum QStyle yang jarang dipakai kayak gini cuma kebaca lewat bentuk
+        # scoped-nya. Bentuk flat bisa lempar AttributeError yang (krn ini
+        # dipanggil dari virtual method Qt) gak keliatan sebagai crash biasa.
+        groove = style.subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt, QStyle.SubControl.SC_SliderGroove, self,
+        )
+        handle = style.subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt, QStyle.SubControl.SC_SliderHandle, self,
+        )
         span = groove.width() - handle.width()
         if span <= 0:
             return None
