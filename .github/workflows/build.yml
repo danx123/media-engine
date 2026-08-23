@@ -97,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v2{{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v3-${{ hashFiles('.github/workflows/build.yml') }}
 
       # 🎬 ffmpeg-sys-next 7.x salah kirim --target_os=windows ke `configure`
       # FFmpeg pas dia yang nge-drive proses cross-compile ("Unknown OS
