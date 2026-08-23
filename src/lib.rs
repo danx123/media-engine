@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
-use numpy::{IntoPyArray, PyArray3, ndarray::Array3};
+use pyo3::wrap_pyfunction;
+use numpy::{IntoPyArray, PyArray1, PyArray3, ndarray::{Array1, Array3}};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -10,6 +11,12 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer as _, Observer as _, Producer as _, Split as _};
+
+// [BARU] rayon buat paralelkan komputasi envelope waveform & BPM detection
+// (chunk-chunk independen -> gampang di-`par_iter()`-in, gak butuh thread
+// pool manual). rustfft buat fungsi FFT visualizer (spectrum analyzer).
+use rayon::prelude::*;
+use rustfft::{FftPlanner, num_complex::Complex32};
 
 // Alias biar gampang disesuaikan kalau nama tipe exact-nya beda dikit di
 // versi `ringbuf` yang kepasang (API crate ini sempat berubah antar versi
@@ -38,6 +45,17 @@ fn init_ffmpeg() -> PyResult<()> {
 // sama-sama manggil Input::seek() jadi sama-sama butuh konversi ini.
 fn av_time_base_ts(seconds: f64) -> i64 {
     (seconds * 1_000_000.0) as i64
+}
+
+/// Konversi ffmpeg_next::Rational (time_base) ke f64 detik-per-tick.
+/// Dipake di beberapa tempat yang butuh bandingin pts (dalam tick) ke
+/// detik absolut (mis. trim di convert_media).
+fn rational_to_f64(r: ffmpeg_next::Rational) -> f64 {
+    if r.denominator() > 0 {
+        r.numerator() as f64 / r.denominator() as f64
+    } else {
+        0.0
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -300,6 +318,15 @@ struct Shared {
     // Ring buffer SPSC gak butuh lock sama sekali buat push/pop, jadi
     // masalah ini ilang di akarnya.
     audio_buffered_hint: AtomicUsize, // isi ring buffer sample, diupdate decode thread abis tiap push
+
+    // [BARU] Snapshot sample audio TERBARU (mono, sudah di-downmix), khusus
+    // buat FFT visualizer (get_spectrum). Sengaja DIPISAH dari ring buffer
+    // playback (`AudioProducer`/`AudioConsumer` di atas) -- itu SPSC dan
+    // sample-nya HABIS begitu dikonsumsi callback cpal (gak bisa "diintip"
+    // tanpa ganggu playback). viz_ring ini cuma buat baca-baca (nampilin
+    // bar spectrum), jadi dipush terus ditulis-timpa (bounded), BUKAN
+    // dikonsumsi/di-pop kayak ring buffer audio asli.
+    viz_ring: Mutex<VecDeque<f32>>,
     // One-shot flag: "buang semua sample yg lagi ngendon di ring buffer
     // SEBELUM lanjut konsumsi normal". Di-set true dari reset_clock() (jadi
     // otomatis kepasang tiap ada seek/step/loop-restart), dibaca & di-reset
@@ -401,6 +428,12 @@ impl Shared {
 const MAX_VIDEO_FRAMES: usize = 90; // ~3 detik @30fps, batas memori readahead
 const LATE_FRAME_DROP_SEC: f64 = 0.1; // frame yg telat >100ms dianggap basi
 
+// [BARU] Kapasitas viz_ring (jumlah sample mono). 8192 cukup buat FFT
+// visualizer sampe fft_size besar (mis. 4096) sambil nyisain sedikit
+// headroom, tanpa nyimpen histori kepanjangan (gak butuh detik-detik lalu,
+// cuma "sesaat sebelum sekarang" buat digambar tiap frame UI).
+const VIZ_RING_CAP: usize = 8192;
+
 #[pyclass(unsendable)]
 struct PlayerEngine {
     shared: Arc<Shared>,
@@ -446,6 +479,7 @@ impl PlayerEngine {
         let shared = Arc::new(Shared {
             video_q: Mutex::new(VecDeque::new()),
             audio_buffered_hint: AtomicUsize::new(0),
+            viz_ring: Mutex::new(VecDeque::with_capacity(VIZ_RING_CAP)),
             audio_flush: AtomicBool::new(false),
             audio_frames_played: AtomicU64::new(0),
             out_sample_rate: AtomicI64::new(48000),
@@ -766,6 +800,59 @@ impl PlayerEngine {
         Ok(Some((arr.into_pyarray(py).into(), frame.pts)))
     }
 
+    /// [BARU] FFT visualizer -- panggil ini tiap tick UI (bareng
+    /// get_frame()) buat ngambil spektrum frekuensi dari audio yang LAGI
+    /// dibunyikan saat ini. `fft_size` HARUS pangkat 2 (mis. 512/1024/2048),
+    /// makin gede makin detail resolusi frekuensinya tapi makin berat.
+    ///
+    /// Balikin array magnitude dalam skala dB, panjang fft_size/2 (bin
+    /// Nyquist ke atas dibuang karena buat sinyal real cuma cerminan bin
+    /// bawahnya -- gak nambah info buat divisualisasikan).
+    fn get_spectrum(&self, py: Python<'_>, fft_size: usize) -> PyResult<Py<PyArray1<f32>>> {
+        if fft_size == 0 || (fft_size & (fft_size - 1)) != 0 {
+            return Err(PyValueError::new_err("fft_size harus pangkat 2 (mis. 512, 1024, 2048)"));
+        }
+
+        // Ambil `fft_size` sample TERBARU dari viz_ring. Kalau belum cukup
+        // (baru mulai play / lagi diam), padding nol di depan -- daripada
+        // dilempar error tiap tick UI yang notabene bakal sering kejadian
+        // pas awal playback.
+        let samples: Vec<f32> = {
+            let viz = self.shared.viz_ring.lock().unwrap();
+            let have = viz.len();
+            if have >= fft_size {
+                viz.iter().skip(have - fft_size).copied().collect()
+            } else {
+                let mut v = vec![0.0f32; fft_size - have];
+                v.extend(viz.iter().copied());
+                v
+            }
+        };
+
+        // Windowing (Hann) biar spektrum gak "bocor" (spectral leakage)
+        // gara-gara motong sinyal secara tegas di tepi buffer.
+        let mut buf: Vec<Complex32> = samples.iter().enumerate().map(|(i, &s)| {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos();
+            Complex32::new(s * w, 0.0)
+        }).collect();
+
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        fft.process(&mut buf);
+
+        let half = fft_size / 2;
+        let norm = fft_size as f32;
+        let spectrum: Vec<f32> = buf[..half].iter().map(|c| {
+            let mag = c.norm() / norm;
+            // dB, dikasih floor -120dB biar log(0) (sample diem total)
+            // gak ngehasilin -inf yang bikin widget UI kacau pas digambar.
+            20.0 * mag.max(1e-6).log10()
+        }).collect();
+
+        let arr = Array1::from_vec(spectrum);
+        Ok(arr.into_pyarray(py).into())
+    }
+
     /// Hentikan playback & kedua thread decode. Panggil eksplisit sebelum
     /// object di-drop kalau mau nutup lebih cepat / ganti file.
     fn close(&mut self) {
@@ -1031,7 +1118,60 @@ fn push_resampled_audio_frame(
     out_layout: ffmpeg_next::util::channel_layout::ChannelLayout,
     out_rate: u32,
     out_channels: u16,
+    expected_audio_pts: &mut f64,
+    atb: f64,
 ) {
+    // Ambil PTS frame aktual, atau gunakan expected jika tidak ada
+    let frame_pts = aframe.timestamp().map(|ts| ts as f64 * atb).unwrap_or(*expected_audio_pts);
+
+    // 1. PAD SILENCE JIKA ADA GAP (Start Delay / Audio Bolong)
+    // Toleransi 0.1 detik untuk mencegah pergeseran sync.
+    if frame_pts > *expected_audio_pts + 0.1 {
+        let raw_gap_sec = frame_pts - *expected_audio_pts;
+
+        // [FIX] BATASI gap yang di-pad. Gap gede (misal belasan detik)
+        // hampir pasti BUKAN silence asli di track, tapi anomali PTS
+        // (glitch timestamp/reorder codec di titik tertentu file).
+        // Kalau dibiarin tanpa batas, loop backpressure di bawah bakal
+        // ngabisin waktu WALL-CLOCK nyata cuma buat nyorong silence
+        // sebanyak itu ke ring buffer -- sementara video jalan terus
+        // independen dan bisa nyampe EOF duluan (nge-trigger shared.stop)
+        // SEBELUM decode thread ini sempet balik ngedecode sisa audio
+        // ASLI setelah titik gap tsb. Efeknya: sisa audio asli abis
+        // titik gap ini ilang total, kedengeran kayak "audio berhenti
+        // duluan" walau file aslinya audio-nya lebih panjang.
+        // Dicap ke MAX_GAP_PAD_SEC detik: gap wajar (start delay dsb)
+        // tetep di-pad buat sync, gap ekstrem cuma di-log & di-resync
+        // tanpa nelen waktu real audio berikutnya.
+        const MAX_GAP_PAD_SEC: f64 = 2.0;
+        if raw_gap_sec > MAX_GAP_PAD_SEC {
+            eprintln!(
+                "[media_engine] PTS jump gede ({:.2}s) kedetect @ ~{:.2}s -- dianggap glitch timestamp (bukan silence asli), pad dibatasin ke {:.1}s biar sisa audio asli abis titik ini tetep sempet ke-decode",
+                raw_gap_sec, shared.position(), MAX_GAP_PAD_SEC,
+            );
+        }
+        let gap_sec = raw_gap_sec.min(MAX_GAP_PAD_SEC);
+        let gap_samples = (gap_sec * out_rate as f64) as usize * out_channels as usize;
+        let silence = vec![0.0f32; 2048.min(gap_samples)];
+        let mut pushed_total = 0;
+        let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
+
+        while pushed_total < gap_samples {
+            if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
+                break;
+            }
+            if producer.occupied_len() >= a_cap {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let to_push = (gap_samples - pushed_total).min(silence.len());
+            let pushed = producer.push_slice(&silence[..to_push]);
+            pushed_total += pushed;
+            shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+        }
+    }
+
+    // 2. SETUP RESAMPLER
     if resampler.is_none() {
         let src_layout = if aframe.channel_layout().bits() != 0 {
             aframe.channel_layout()
@@ -1050,6 +1190,8 @@ fn push_resampled_audio_frame(
             }
         };
     }
+
+    // 3. RESAMPLE & PUSH FRAME AKTUAL (Anti-Drop Backpressure)
     if let Some(rs) = resampler.as_mut() {
         let mut resampled = ffmpeg_next::frame::Audio::empty();
         match rs.run(aframe, &mut resampled) {
@@ -1060,12 +1202,41 @@ fn push_resampled_audio_frame(
                     let floats: &[f32] = unsafe {
                         std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_samples)
                     };
-                    // Kalau ring buffer kebetulan lagi penuh (jarang, krn
-                    // backpressure di atas), push_slice cuma ngambil
-                    // sebisanya & sisanya didrop -- gak masalah, itu cuma
-                    // beberapa ms sample doang.
-                    let _ = producer.push_slice(floats);
-                    shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+
+                    // [BARU] Downmix ke mono & simpen ke viz_ring buat FFT
+                    // visualizer. Ini SELALU jalan (gak peduli backpressure
+                    // ring buffer playback di bawah) karena tujuannya cuma
+                    // nampilin "apa yang lagi didecode sekarang", bukan
+                    // ikut aturan sinkronisasi audio-video.
+                    {
+                        let ch = out_channels as usize;
+                        let mut viz = shared.viz_ring.lock().unwrap();
+                        for frame in floats.chunks(ch) {
+                            let mono = frame.iter().sum::<f32>() / ch as f32;
+                            viz.push_back(mono);
+                        }
+                        while viz.len() > VIZ_RING_CAP {
+                            viz.pop_front();
+                        }
+                    }
+
+                    let mut pushed_total = 0;
+                    let a_cap = (out_rate as usize) * (out_channels as usize) * 2;
+
+                    // Loop ini menjamin tidak ada 1 sampel pun yang dibuang saat ring buffer penuh
+                    while pushed_total < n_samples {
+                        if shared.stop.load(Ordering::Relaxed) || shared.audio_flush.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if producer.occupied_len() >= a_cap {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        let chunk = &floats[pushed_total..];
+                        let pushed = producer.push_slice(chunk);
+                        pushed_total += pushed;
+                        shared.audio_buffered_hint.store(producer.occupied_len(), Ordering::Relaxed);
+                    }
                 }
             }
             Err(e) => {
@@ -1073,6 +1244,10 @@ fn push_resampled_audio_frame(
             }
         }
     }
+
+    // 4. UPDATE EXPECTED PTS UNTUK ITERASI BERIKUTNYA
+    let duration_sec = aframe.samples() as f64 / aframe.rate() as f64;
+    *expected_audio_pts = frame_pts + duration_sec;
 }
 
 fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: AudioProducer) {
@@ -1089,6 +1264,15 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
         Some(s) => s.index(),
         None => return,
     };
+
+    // Time base stream audio -- dipakai buat konversi PTS mentah (dalam unit
+    // stream) ke detik, biar bisa dibandingin sama expected_audio_pts.
+    let atb = {
+        let s = input_ctx.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
+        let tb = s.time_base();
+        if tb.denominator() > 0 { tb.numerator() as f64 / tb.denominator() as f64 } else { 0.0 }
+    };
+
     let mut adecoder = {
         let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Audio).unwrap();
         match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
@@ -1104,6 +1288,11 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
     let out_channels = shared.out_channels.load(Ordering::Relaxed) as u16;
     let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::default(out_channels as i32);
     let a_cap = (out_rate as usize) * (out_channels as usize) * 2; // ~2 detik, sama kayak sebelumnya
+
+    // State tracker: PTS (dalam detik) yang "seharusnya" terjadi berikutnya
+    // di ring buffer, dipakai buat deteksi gap (start delay / bolong di
+    // tengah) dan nyuntik silence biar timeline audio gak geser ke kiri.
+    let mut expected_audio_pts: f64 = 0.0;
 
     let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
     let mut aframe = ffmpeg_next::frame::Audio::empty();
@@ -1135,6 +1324,11 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             }
             packet_iter = Some(input_ctx.packets());
             applied_seek_seq = current_seq;
+
+            // Abis seek, expected PTS harus di-reset ke target seek --
+            // kalau enggak, frame pertama setelah seek bakal keliatan
+            // "gap" palsu dibanding posisi lama.
+            expected_audio_pts = sec;
         }
 
         if !shared.playing.load(Ordering::Relaxed) {
@@ -1168,6 +1362,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                         push_resampled_audio_frame(
                             &aframe, &mut resampler, &mut producer, &shared,
                             adecoder.channels() as i32, out_layout, out_rate, out_channels,
+                            &mut expected_audio_pts, atb,
                         );
                     }
                     eprintln!(
@@ -1196,10 +1391,11 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
             push_resampled_audio_frame(
                 &aframe, &mut resampler, &mut producer, &shared,
                 adecoder.channels() as i32, out_layout, out_rate, out_channels,
+                &mut expected_audio_pts, atb,
             );
         }
     }
-    }
+}
 
 
 fn scale_to_rgb(
@@ -1238,6 +1434,895 @@ fn scale_to_rgb(
 }
 
 // ═══════════════════════════════════════════════
+// BAGIAN 4: ANALISA AUDIO -- envelope waveform + BPM detection.
+// Dipakai buat gambar preview waveform (kayak di audio cutter) dan
+// estimasi tempo lagu. Beda dari PlayerEngine (bagian 3): ini decode
+// SELURUH file sekaligus di luar playback, bukan streaming real-time.
+// ═══════════════════════════════════════════════
+
+/// Decode seluruh track audio terbaik di file jadi mono f32 pada
+/// `out_rate` tertentu. Dipakai bareng buat envelope waveform & BPM
+/// detection -- keduanya butuh representasi sample yang sama, jadi
+/// decode-nya cukup sekali.
+///
+/// Sengaja di-downsample (bukan pakai sample rate asli file) karena buat
+/// dua analisa ini kita gak butuh presisi sample-per-sample -- 22050Hz udah
+/// lebih dari cukup buat nangkep amplop energi (envelope) & onset drum/kick
+/// (BPM), sambil ngirit memori & waktu decode buat file yang panjang.
+fn decode_audio_mono(file_path: &str, out_rate: u32) -> PyResult<Vec<f32>> {
+    init_ffmpeg()?;
+    let path = Path::new(file_path);
+    let mut ictx = ffmpeg_next::format::input(&path)
+        .map_err(|e| PyIOError::new_err(format!("Buka file: {}", e)))?;
+
+    let audio_idx = ictx.streams()
+        .best(ffmpeg_next::media::Type::Audio)
+        .ok_or_else(|| PyValueError::new_err("Tidak ada aliran audio"))?
+        .index();
+
+    let params = ictx.stream(audio_idx).unwrap().parameters();
+    let ctx = ffmpeg_next::codec::context::Context::from_parameters(params)
+        .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder audio: {}", e)))?;
+    let mut decoder = ctx.decoder().audio()
+        .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder audio: {}", e)))?;
+
+    let out_layout = ffmpeg_next::util::channel_layout::ChannelLayout::MONO;
+    let mut resampler: Option<ffmpeg_next::software::resampling::Context> = None;
+
+    let mut samples: Vec<f32> = Vec::new();
+    let mut decoded = ffmpeg_next::frame::Audio::empty();
+
+    // Helper lokal: resample 1 frame yang udah didecode & append hasilnya
+    // ke `samples`. Resampler dibangun lazy (baru pas frame pertama)
+    // karena butuh tau format/channel-layout/rate SUMBER dulu -- sama
+    // persis alasannya kayak di push_resampled_audio_frame() (bagian 3),
+    // format decoder kadang beda dari yang dilaporin stream parameters.
+    macro_rules! resample_and_push {
+        ($frame:expr) => {{
+            if resampler.is_none() {
+                let src_layout = if $frame.channel_layout().bits() != 0 {
+                    $frame.channel_layout()
+                } else {
+                    ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder.channels() as i32)
+                };
+                resampler = ffmpeg_next::software::resampling::Context::get(
+                    $frame.format(), src_layout, $frame.rate(),
+                    ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Packed),
+                    out_layout, out_rate,
+                ).ok();
+            }
+            if let Some(rs) = resampler.as_mut() {
+                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                if rs.run($frame, &mut resampled).is_ok() {
+                    let n = resampled.samples();
+                    let raw = resampled.data(0);
+                    if raw.len() >= n * 4 {
+                        let floats: &[f32] = unsafe {
+                            std::slice::from_raw_parts(raw.as_ptr() as *const f32, n)
+                        };
+                        samples.extend_from_slice(floats);
+                    }
+                }
+            }
+        }};
+    }
+
+    for (stream, packet) in ictx.packets() {
+        if stream.index() != audio_idx { continue; }
+        if decoder.send_packet(&packet).is_err() { continue; }
+        while decoder.receive_frame(&mut decoded).is_ok() {
+            resample_and_push!(&decoded);
+        }
+    }
+    // Drain sisa frame yang masih ke-buffer internal decoder (decode
+    // delay/reorder) -- tanpa ini, ekor file (terutama AAC/Opus) bisa
+    // ilang dari hasil analisa, sama kayak catatan di audio_decode_loop().
+    let _ = decoder.send_eof();
+    while decoder.receive_frame(&mut decoded).is_ok() {
+        resample_and_push!(&decoded);
+    }
+
+    Ok(samples)
+}
+
+/// Envelope waveform: ringkas `samples` jadi `target_points` nilai RMS
+/// (0..1 setelah dinormalisasi), buat digambar sebagai preview waveform di
+/// UI (mis. audio cutter / tag editor). Dipecah per-chunk & dihitung
+/// paralel lewat rayon karena tiap chunk independen -- gak ada
+/// ketergantungan antar-chunk sama sekali.
+fn compute_envelope(samples: &[f32], target_points: usize) -> Vec<f32> {
+    let target_points = target_points.max(1);
+    if samples.is_empty() {
+        return vec![0.0; target_points];
+    }
+    let chunk_size = (samples.len() / target_points).max(1);
+
+    let mut envelope: Vec<f32> = (0..target_points).into_par_iter().map(|i| {
+        let start = i * chunk_size;
+        if start >= samples.len() {
+            return 0.0;
+        }
+        let end = (start + chunk_size).min(samples.len());
+        let chunk = &samples[start..end];
+        // RMS, bukan peak -- peak kelewat sensitif ke 1 sample transient
+        // dan bikin waveform preview keliatan "berduri", RMS lebih halus
+        // dan lebih ngegambarin persepsi kenyaringan.
+        let sum_sq: f32 = chunk.iter().map(|s| s * s).sum();
+        (sum_sq / chunk.len() as f32).sqrt()
+    }).collect();
+
+    let peak = envelope.iter().cloned().fold(0.0f32, f32::max);
+    if peak > 0.0 {
+        envelope.par_iter_mut().for_each(|v| *v /= peak);
+    }
+    envelope
+}
+
+/// Estimasi BPM lewat onset-energy + autocorrelation. Algoritma sengaja
+/// dibikin ringan (bukan full spectral-flux multi-band) supaya cepet buat
+/// file panjang:
+/// 1. Energi RMS tiap window kecil (`hop` sample) -> "amplop energi" kasar.
+/// 2. Onset strength = kenaikan energi positif antar-window (nangkep hit
+///    kick/snare drum, transient lain diabaikan kalau energinya turun).
+/// 3. Autocorrelation onset signal di rentang lag yang sesuai 60-200 BPM,
+///    lag dengan korelasi tertinggi = periode antar-beat yang dominan.
+/// Cukup akurat buat musik dengan beat yang jelas (pop/EDM/rock), kurang
+/// reliable buat musik tanpa beat tetap (ambient, klasik rubato, dll) --
+/// itu batasan algoritma ini, bukan bug.
+fn detect_bpm(samples: &[f32], sample_rate: u32) -> f32 {
+    const HOP: usize = 512;
+    if samples.len() < HOP * 8 {
+        return 0.0; // kependekan buat dianalisa
+    }
+
+    let n_frames = samples.len() / HOP;
+    let energy: Vec<f32> = (0..n_frames).into_par_iter().map(|i| {
+        let start = i * HOP;
+        let end = (start + HOP).min(samples.len());
+        let chunk = &samples[start..end];
+        (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt()
+    }).collect();
+
+    let onset: Vec<f32> = energy.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect();
+    if onset.is_empty() {
+        return 0.0;
+    }
+
+    let frame_rate = sample_rate as f32 / HOP as f32; // frame onset per detik
+    const MIN_BPM: f32 = 60.0;
+    const MAX_BPM: f32 = 200.0;
+    let min_lag = ((60.0 / MAX_BPM) * frame_rate).round().max(1.0) as usize;
+    let max_lag = (((60.0 / MIN_BPM) * frame_rate).round() as usize).min(onset.len().saturating_sub(1));
+
+    if max_lag <= min_lag {
+        return 0.0;
+    }
+
+    // Cari lag (dalam satuan frame onset) dengan autocorrelation
+    // tertinggi -- itu periode antar-beat yang paling dominan. Kandidat
+    // lag dicoba paralel karena tiap lag itung dot-product independen.
+    let (best_lag, _) = (min_lag..=max_lag).into_par_iter().map(|lag| {
+        let mut corr = 0.0f32;
+        for i in 0..(onset.len() - lag) {
+            corr += onset[i] * onset[i + lag];
+        }
+        (lag, corr)
+    }).reduce(|| (min_lag, f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
+
+    if best_lag == 0 {
+        return 0.0;
+    }
+    60.0 * frame_rate / best_lag as f32
+}
+
+/// [BARU] Analisa audio lengkap buat 1 file: envelope waveform (buat
+/// preview di UI, mis. audio cutter/tag editor) + estimasi BPM, dalam satu
+/// kali decode (biar gak decode file yang sama dua kali).
+///
+/// `target_points`: jumlah titik envelope yang mau digambar (mis. 800 buat
+/// waveform selebar 800px di layar).
+///
+/// Balikin (array_envelope_0..1, bpm). bpm = 0.0 kalau gagal dideteksi
+/// (file kependekan / gak ada beat yang jelas).
+#[pyfunction]
+fn analyze_waveform(py: Python<'_>, file_path: &str, target_points: usize) -> PyResult<(Py<PyArray1<f32>>, f32)> {
+    const ANALYSIS_RATE: u32 = 22050;
+    let samples = decode_audio_mono(file_path, ANALYSIS_RATE)?;
+    if samples.is_empty() {
+        return Err(PyValueError::new_err("Tidak ada sample audio yang bisa dibaca dari file ini"));
+    }
+
+    let envelope = compute_envelope(&samples, target_points);
+    let bpm = detect_bpm(&samples, ANALYSIS_RATE);
+
+    let arr = Array1::from_vec(envelope);
+    Ok((arr.into_pyarray(py).into(), bpm))
+}
+
+// ═══════════════════════════════════════════════
+// BAGIAN 5: KONVERTER AUDIO/VIDEO -- transcode/remux native lewat
+// ffmpeg-next, gantiin subprocess ffmpeg.exe (kayak yang dipakai Macan
+// Converter sekarang) buat kasus umum. Mendukung 2 mode per track:
+//   - codec = None  -> stream copy (remux, gak re-encode, CEPAT & lossless,
+//     tapi output codec ngikut sumber -- gak bisa ganti container yg gak
+//     kompatibel sama codec asalnya, mis. H.265 ke .avi)
+//   - codec = Some("libx264"/"aac"/dll) -> full transcode
+// ═══════════════════════════════════════════════
+
+/// Cek apakah muxer output butuh "global header" (banyak container modern
+/// kayak MP4/MOV/MKV butuh ini buat stream yang di-encode -- extradata
+/// SPS/PPS dkk ditaro di container header, bukan di tiap paket). Encoder
+/// WAJIB tau ini SEBELUM open(), makanya dicek duluan sebelum setup encoder.
+fn needs_global_header(octx: &ffmpeg_next::format::context::Output) -> bool {
+    octx.format().flags().contains(ffmpeg_next::format::Flags::GLOBAL_HEADER)
+}
+
+/// Konversi/transcode media (audio dan/atau video) ke file baru.
+///
+/// - `video_codec`/`audio_codec`: nama encoder ffmpeg (mis. "libx264",
+///   "libx265", "aac", "libmp3lame", "libopus"). `None` = stream copy
+///   (track itu disalin apa adanya, gak di-encode ulang).
+/// - `video_bitrate`/`audio_bitrate`: dalam bit per detik, cuma berlaku
+///   kalau track itu di-transcode (diabaikan kalau stream copy).
+/// - `drop_video`/`drop_audio`: buang track itu sepenuhnya dari output
+///   (mis. `drop_video=true` buat ekstrak audio doang dari file video).
+/// - `trim_start`/`trim_end`: [BARU] potong media ke rentang waktu
+///   tertentu (detik, absolut dari awal file sumber). Timeline output
+///   di-nol-in ulang mulai dari `trim_start` (jadi output selalu mulai
+///   dari pts=0, bukan dari `trim_start` aslinya). Kalau kedua-duanya
+///   `None`, seluruh file dikonversi apa adanya (perilaku lama, gak
+///   berubah). CATATAN: buat track yang di-stream-copy, potongannya
+///   "cepat tapi kasar" -- pemotongan lompat ke keyframe terdekat
+///   SEBELUM `trim_start` (gak bisa presisi frame tanpa re-encode, sama
+///   kayak batasan `ffmpeg -ss` sebelum `-i`). Buat presisi frame-exact,
+///   pakai `video_codec`/`audio_codec` (mode transcode).
+///
+/// CATATAN buat Nadia: fungsi ini nulis manual lewat API encoder
+/// ffmpeg-next (bukan spawn ffmpeg.exe kayak Macan Converter sekarang).
+/// Nama-nama method encoder (`open_as`, `set_flags`, dll) kadang beda
+/// dikit antar versi minor ffmpeg-next -- kalau `cargo check` komplen di
+/// bagian ini, cek `cargo doc --open -p ffmpeg-next` dulu match sama versi
+/// 7.1 yang kepasang, jangan asal tebak nama method-nya.
+#[pyfunction]
+#[pyo3(signature = (input_path, output_path, video_codec=None, audio_codec=None, video_bitrate=None, audio_bitrate=None, drop_video=false, drop_audio=false, trim_start=None, trim_end=None))]
+fn convert_media(
+    input_path: &str,
+    output_path: &str,
+    video_codec: Option<&str>,
+    audio_codec: Option<&str>,
+    video_bitrate: Option<i64>,
+    audio_bitrate: Option<i64>,
+    drop_video: bool,
+    drop_audio: bool,
+    trim_start: Option<f64>,
+    trim_end: Option<f64>,
+) -> PyResult<()> {
+    init_ffmpeg()?;
+
+    let in_path = Path::new(input_path);
+    let mut ictx = ffmpeg_next::format::input(&in_path)
+        .map_err(|e| PyIOError::new_err(format!("Buka file input: {}", e)))?;
+
+    let vidx = if !drop_video {
+        ictx.streams().best(ffmpeg_next::media::Type::Video).map(|s| s.index())
+    } else { None };
+    let aidx = if !drop_audio {
+        ictx.streams().best(ffmpeg_next::media::Type::Audio).map(|s| s.index())
+    } else { None };
+
+    if vidx.is_none() && aidx.is_none() {
+        return Err(PyValueError::new_err("Tidak ada track video/audio yang bisa dikonversi (cek drop_video/drop_audio)"));
+    }
+
+    if let Some(start) = trim_start {
+        // Seek demuxer sebelum mulai baca paket. Cuma "ancang-ancang" ke
+        // keyframe terdekat -- offset presisi ke pts absolut ditangani per
+        // track lewat base_pts di VideoLine/AudioLine (lihat handle_packet).
+        let ts = av_time_base_ts(start);
+        let _ = ictx.seek(ts, ..ts);
+    }
+    let trim_active = trim_start.is_some() || trim_end.is_some();
+
+    let out_path = Path::new(output_path);
+    let mut octx = ffmpeg_next::format::output(&out_path)
+        .map_err(|e| PyIOError::new_err(format!("Buat file output: {}", e)))?;
+    let global_header = needs_global_header(&octx);
+
+    // ── Setup track video ──
+    let mut video_line: Option<VideoLine> = None;
+    if let Some(idx) = vidx {
+        let istream = ictx.stream(idx).unwrap();
+        let in_tb = istream.time_base();
+        let params = istream.parameters();
+
+        if let Some(codec_name) = video_codec {
+            // Transcode: decoder sumber -> scaler ke YUV420P (format paling
+            // universal didukung encoder umum: x264/x265/mpeg4/vp9) -> encoder.
+            let decoder = ffmpeg_next::codec::context::Context::from_parameters(params)
+                .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder video: {}", e)))?
+                .decoder().video()
+                .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder video: {}", e)))?;
+
+            let codec = ffmpeg_next::encoder::find_by_name(codec_name)
+                .ok_or_else(|| PyValueError::new_err(format!("Encoder video '{}' tidak ditemukan/tidak dikompilasi di FFmpeg", codec_name)))?;
+
+            let mut ost = octx.add_stream(codec)
+                .map_err(|e| PyRuntimeError::new_err(format!("Tambah stream video: {}", e)))?;
+
+            let fps = decoder.frame_rate().unwrap_or(ffmpeg_next::Rational(25, 1));
+            let mut enc = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+                .encoder().video()
+                .map_err(|e| PyRuntimeError::new_err(format!("Buat encoder video: {}", e)))?;
+            enc.set_width(decoder.width());
+            enc.set_height(decoder.height());
+            enc.set_format(ffmpeg_next::util::format::Pixel::YUV420P);
+            enc.set_time_base(fps.invert());
+            enc.set_frame_rate(Some(fps));
+            if let Some(br) = video_bitrate {
+                enc.set_bit_rate(br as usize);
+            }
+            if global_header {
+                enc.set_flags(ffmpeg_next::codec::flag::Flags::GLOBAL_HEADER);
+            }
+            let encoder = enc.open_as(codec)
+                .map_err(|e| PyRuntimeError::new_err(format!("Buka encoder video: {}", e)))?;
+            ost.set_parameters(&encoder);
+
+            let scaler = ffmpeg_next::software::scaling::Context::get(
+                decoder.format(), decoder.width(), decoder.height(),
+                ffmpeg_next::util::format::Pixel::YUV420P, decoder.width(), decoder.height(),
+                ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+            ).map_err(|e| PyRuntimeError::new_err(format!("Buat scaler video: {}", e)))?;
+
+            video_line = Some(VideoLine {
+                in_index: idx,
+                out_index: ost.index(),
+                in_tb,
+                out_tb: ost.time_base(),
+                in_tb_f64: rational_to_f64(in_tb),
+                base_pts: None,
+                shift_active: trim_active,
+                trim_end_sec: trim_end,
+                done: false,
+                mode: TranscodeMode::Encode {
+                    decoder, encoder, scaler,
+                },
+            });
+        } else {
+            // Stream copy (remux) -- pola persis contoh remux.rs resmi
+            // ffmpeg-next: add_stream(None-codec), lalu set_parameters()
+            // langsung dari parameter stream input, tanpa decode sama sekali.
+            let mut ost = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::None))
+                .map_err(|e| PyRuntimeError::new_err(format!("Tambah stream video (copy): {}", e)))?;
+            ost.set_parameters(params);
+            video_line = Some(VideoLine {
+                in_index: idx,
+                out_index: ost.index(),
+                in_tb,
+                out_tb: istream.time_base(),
+                in_tb_f64: rational_to_f64(in_tb),
+                base_pts: None,
+                shift_active: trim_active,
+                trim_end_sec: trim_end,
+                done: false,
+                mode: TranscodeMode::Copy,
+            });
+        }
+    }
+
+    // ── Setup track audio ──
+    let mut audio_line: Option<AudioLine> = None;
+    if let Some(idx) = aidx {
+        let istream = ictx.stream(idx).unwrap();
+        let in_tb = istream.time_base();
+        let params = istream.parameters();
+
+        if let Some(codec_name) = audio_codec {
+            let decoder = ffmpeg_next::codec::context::Context::from_parameters(params)
+                .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder audio: {}", e)))?
+                .decoder().audio()
+                .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder audio: {}", e)))?;
+
+            let codec = ffmpeg_next::encoder::find_by_name(codec_name)
+                .ok_or_else(|| PyValueError::new_err(format!("Encoder audio '{}' tidak ditemukan/tidak dikompilasi di FFmpeg", codec_name)))?;
+
+            let mut ost = octx.add_stream(codec)
+                .map_err(|e| PyRuntimeError::new_err(format!("Tambah stream audio: {}", e)))?;
+
+            let out_rate = decoder.rate();
+            let out_layout = if decoder.channel_layout().bits() != 0 {
+                decoder.channel_layout()
+            } else {
+                ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder.channels() as i32)
+            };
+
+            let mut enc = ffmpeg_next::codec::context::Context::new_with_codec(codec)
+                .encoder().audio()
+                .map_err(|e| PyRuntimeError::new_err(format!("Buat encoder audio: {}", e)))?;
+            enc.set_rate(out_rate as i32);
+            enc.set_channel_layout(out_layout);
+            enc.set_format(ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Planar));
+            enc.set_time_base(ffmpeg_next::Rational(1, out_rate as i32));
+            if let Some(br) = audio_bitrate {
+                enc.set_bit_rate(br as usize);
+            }
+            if global_header {
+                enc.set_flags(ffmpeg_next::codec::flag::Flags::GLOBAL_HEADER);
+            }
+            let encoder = enc.open_as(codec)
+                .map_err(|e| PyRuntimeError::new_err(format!("Buka encoder audio: {}", e)))?;
+            ost.set_parameters(&encoder);
+
+            let resampler = ffmpeg_next::software::resampling::Context::get(
+                decoder.format(), decoder.channel_layout(), decoder.rate(),
+                encoder.format(), encoder.channel_layout(), encoder.rate(),
+            ).map_err(|e| PyRuntimeError::new_err(format!("Buat resampler audio: {}", e)))?;
+
+            audio_line = Some(AudioLine {
+                in_index: idx,
+                out_index: ost.index(),
+                in_tb,
+                out_tb: ost.time_base(),
+                in_tb_f64: rational_to_f64(in_tb),
+                base_pts: None,
+                shift_active: trim_active,
+                trim_end_sec: trim_end,
+                done: false,
+                mode: AudioTranscodeMode::Encode {
+                    decoder, encoder, resampler,
+                },
+            });
+        } else {
+            let mut ost = octx.add_stream(ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::None))
+                .map_err(|e| PyRuntimeError::new_err(format!("Tambah stream audio (copy): {}", e)))?;
+            ost.set_parameters(params);
+            audio_line = Some(AudioLine {
+                in_index: idx,
+                out_index: ost.index(),
+                in_tb,
+                out_tb: istream.time_base(),
+                in_tb_f64: rational_to_f64(in_tb),
+                base_pts: None,
+                shift_active: trim_active,
+                trim_end_sec: trim_end,
+                done: false,
+                mode: AudioTranscodeMode::Copy,
+            });
+        }
+    }
+
+    octx.write_header()
+        .map_err(|e| PyRuntimeError::new_err(format!("Tulis header output: {}", e)))?;
+
+    // [PENTING] Refresh out_tb SETELAH write_header(), BUKAN sebelumnya.
+    // Sebagian muxer (mis. MP4) suka nimpa/finalize time_base stream pas
+    // avformat_write_header() dipanggil -- kalau out_tb yang dipake buat
+    // rescale_ts() masih nilai lama (dari sebelum header ditulis), paket
+    // yang ditulis bisa salah timing di kontainer akhir.
+    if let Some(vl) = video_line.as_mut() {
+        vl.out_tb = octx.stream(vl.out_index).unwrap().time_base();
+    }
+    if let Some(al) = audio_line.as_mut() {
+        al.out_tb = octx.stream(al.out_index).unwrap().time_base();
+    }
+
+    // ── Loop utama: demux paket, salurkan ke jalur video/audio yang cocok ──
+    for (stream, mut packet) in ictx.packets() {
+        let sidx = stream.index();
+        if let Some(vl) = video_line.as_mut() {
+            if sidx == vl.in_index {
+                vl.handle_packet(&mut packet, &mut octx)?;
+            }
+        }
+        if let Some(al) = audio_line.as_mut() {
+            if sidx == al.in_index {
+                al.handle_packet(&mut packet, &mut octx)?;
+            }
+        }
+        // Track lain (subtitle dll) sengaja diabaikan -- converter ini
+        // fokus audio/video doang, sama kayak scope Macan Converter yang
+        // sekarang.
+
+        // [BARU] Kalau trim_end dipasang, tiap line nandain dirinya
+        // `done` begitu ngelewatin trim_end. Begitu SEMUA line yang
+        // aktif udah done, berhenti demux -- gak perlu baca sisa file.
+        let v_done = video_line.as_ref().map(|l| l.done).unwrap_or(true);
+        let a_done = audio_line.as_ref().map(|l| l.done).unwrap_or(true);
+        if v_done && a_done {
+            break;
+        }
+    }
+
+    // ── Flush: drain decoder+encoder yang masih nyimpen frame/paket ──
+    if let Some(vl) = video_line.as_mut() {
+        vl.flush(&mut octx)?;
+    }
+    if let Some(al) = audio_line.as_mut() {
+        al.flush(&mut octx)?;
+    }
+
+    octx.write_trailer()
+        .map_err(|e| PyRuntimeError::new_err(format!("Tulis trailer output: {}", e)))?;
+
+    Ok(())
+}
+
+enum TranscodeMode {
+    Copy,
+    Encode {
+        decoder: ffmpeg_next::decoder::Video,
+        encoder: ffmpeg_next::encoder::Video,
+        scaler: ffmpeg_next::software::scaling::Context,
+    },
+}
+
+struct VideoLine {
+    in_index: usize,
+    out_index: usize,
+    in_tb: ffmpeg_next::Rational,
+    out_tb: ffmpeg_next::Rational,
+    in_tb_f64: f64,
+    // [BARU] Dukungan trim -- lihat catatan lengkap di dokumentasi
+    // convert_media(). base_pts = pts (dalam tick in_tb) dari paket
+    // PERTAMA yang lewat sini setelah seek; semua paket berikutnya
+    // digeser relatif ke ini biar output mulai dari pts=0.
+    base_pts: Option<i64>,
+    shift_active: bool,
+    trim_end_sec: Option<f64>,
+    done: bool,
+    mode: TranscodeMode,
+}
+
+impl VideoLine {
+    fn handle_packet(&mut self, packet: &mut ffmpeg_next::Packet, octx: &mut ffmpeg_next::format::context::Output) -> PyResult<()> {
+        if self.done {
+            return Ok(());
+        }
+
+        // [BARU] Cek trim_end SEBELUM digeser -- perbandingannya harus ke
+        // posisi ABSOLUT di file asli, bukan posisi yang udah di-nol-in.
+        if let Some(end_sec) = self.trim_end_sec {
+            let raw_ts = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
+            if (raw_ts as f64) * self.in_tb_f64 > end_sec {
+                self.done = true;
+                return Ok(());
+            }
+        }
+
+        // [BARU] Geser pts/dts biar timeline output mulai dari 0, cuma
+        // aktif kalau trim beneran dipake (trim_start/trim_end) -- kalau
+        // enggak, paket dipake apa adanya, sama kayak sebelum ada trim.
+        if self.shift_active {
+            let raw_ts = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
+            let base = *self.base_pts.get_or_insert(raw_ts);
+            packet.set_pts(packet.pts().map(|p| p - base));
+            packet.set_dts(packet.dts().map(|d| d - base));
+        }
+
+        match &mut self.mode {
+            TranscodeMode::Copy => {
+                packet.rescale_ts(self.in_tb, self.out_tb);
+                packet.set_stream(self.out_index);
+                packet.write_interleaved(octx)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Tulis paket video: {}", e)))?;
+            }
+            TranscodeMode::Encode { decoder, encoder, scaler } => {
+                decoder.send_packet(packet)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket video ke decoder: {}", e)))?;
+                let mut decoded = ffmpeg_next::frame::Video::empty();
+                while decoder.receive_frame(&mut decoded).is_ok() {
+                    let mut scaled = ffmpeg_next::frame::Video::empty();
+                    scaler.run(&decoded, &mut scaled)
+                        .map_err(|e| PyRuntimeError::new_err(format!("Scale frame video: {}", e)))?;
+                    scaled.set_pts(decoded.pts());
+                    encoder.send_frame(&scaled)
+                        .map_err(|e| PyRuntimeError::new_err(format!("Kirim frame video ke encoder: {}", e)))?;
+                    Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_encoder(
+        encoder: &mut ffmpeg_next::encoder::Video,
+        out_index: usize,
+        out_tb: ffmpeg_next::Rational,
+        octx: &mut ffmpeg_next::format::context::Output,
+    ) -> PyResult<()> {
+        let mut enc_pkt = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut enc_pkt).is_ok() {
+            enc_pkt.set_stream(out_index);
+            enc_pkt.rescale_ts(encoder.time_base(), out_tb);
+            enc_pkt.write_interleaved(octx)
+                .map_err(|e| PyRuntimeError::new_err(format!("Tulis paket video hasil encode: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, octx: &mut ffmpeg_next::format::context::Output) -> PyResult<()> {
+        if let TranscodeMode::Encode { decoder, encoder, scaler } = &mut self.mode {
+            let _ = decoder.send_eof();
+            let mut decoded = ffmpeg_next::frame::Video::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let mut scaled = ffmpeg_next::frame::Video::empty();
+                if scaler.run(&decoded, &mut scaled).is_ok() {
+                    scaled.set_pts(decoded.pts());
+                    let _ = encoder.send_frame(&scaled);
+                    Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                }
+            }
+            let _ = encoder.send_eof();
+            Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+        }
+        Ok(())
+    }
+}
+
+enum AudioTranscodeMode {
+    Copy,
+    Encode {
+        decoder: ffmpeg_next::decoder::Audio,
+        encoder: ffmpeg_next::encoder::Audio,
+        resampler: ffmpeg_next::software::resampling::Context,
+    },
+}
+
+struct AudioLine {
+    in_index: usize,
+    out_index: usize,
+    in_tb: ffmpeg_next::Rational,
+    out_tb: ffmpeg_next::Rational,
+    in_tb_f64: f64,
+    base_pts: Option<i64>,
+    shift_active: bool,
+    trim_end_sec: Option<f64>,
+    done: bool,
+    mode: AudioTranscodeMode,
+}
+
+impl AudioLine {
+    fn handle_packet(&mut self, packet: &mut ffmpeg_next::Packet, octx: &mut ffmpeg_next::format::context::Output) -> PyResult<()> {
+        if self.done {
+            return Ok(());
+        }
+
+        if let Some(end_sec) = self.trim_end_sec {
+            let raw_ts = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
+            if (raw_ts as f64) * self.in_tb_f64 > end_sec {
+                self.done = true;
+                return Ok(());
+            }
+        }
+
+        if self.shift_active {
+            let raw_ts = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
+            let base = *self.base_pts.get_or_insert(raw_ts);
+            packet.set_pts(packet.pts().map(|p| p - base));
+            packet.set_dts(packet.dts().map(|d| d - base));
+        }
+
+        match &mut self.mode {
+            AudioTranscodeMode::Copy => {
+                packet.rescale_ts(self.in_tb, self.out_tb);
+                packet.set_stream(self.out_index);
+                packet.write_interleaved(octx)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Tulis paket audio: {}", e)))?;
+            }
+            AudioTranscodeMode::Encode { decoder, encoder, resampler } => {
+                decoder.send_packet(packet)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket audio ke decoder: {}", e)))?;
+                let mut decoded = ffmpeg_next::frame::Audio::empty();
+                while decoder.receive_frame(&mut decoded).is_ok() {
+                    let mut resampled = ffmpeg_next::frame::Audio::empty();
+                    if resampler.run(&decoded, &mut resampled).is_ok() {
+                        resampled.set_pts(decoded.pts());
+                        encoder.send_frame(&resampled)
+                            .map_err(|e| PyRuntimeError::new_err(format!("Kirim frame audio ke encoder: {}", e)))?;
+                        Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_encoder(
+        encoder: &mut ffmpeg_next::encoder::Audio,
+        out_index: usize,
+        out_tb: ffmpeg_next::Rational,
+        octx: &mut ffmpeg_next::format::context::Output,
+    ) -> PyResult<()> {
+        let mut enc_pkt = ffmpeg_next::Packet::empty();
+        while encoder.receive_packet(&mut enc_pkt).is_ok() {
+            enc_pkt.set_stream(out_index);
+            enc_pkt.rescale_ts(encoder.time_base(), out_tb);
+            enc_pkt.write_interleaved(octx)
+                .map_err(|e| PyRuntimeError::new_err(format!("Tulis paket audio hasil encode: {}", e)))?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, octx: &mut ffmpeg_next::format::context::Output) -> PyResult<()> {
+        if let AudioTranscodeMode::Encode { decoder, encoder, resampler } = &mut self.mode {
+            let _ = decoder.send_eof();
+            let mut decoded = ffmpeg_next::frame::Audio::empty();
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                if resampler.run(&decoded, &mut resampled).is_ok() {
+                    resampled.set_pts(decoded.pts());
+                    let _ = encoder.send_frame(&resampled);
+                    Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                }
+            }
+            let _ = encoder.send_eof();
+            Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+        }
+        Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════
+// BAGIAN 6: UTILITAS MULTIMEDIA TAMBAHAN -- thumbnail grid & loudness.
+// Sama-sama "decode sekali, dapet hasil sekaligus", cocok buat kebutuhan
+// UI kayak grid preview di media library / normalize volume di
+// converter/audio tools.
+// ═══════════════════════════════════════════════
+
+/// [BARU] Ambil beberapa thumbnail sekaligus dari video, disebar merata
+/// sepanjang durasi (posisi ke-i ada di tengah segmen ke-i, biar gak
+/// kejebak di frame item hitam persis detik 0 / gagal decode persis EOF).
+/// Beda dari VideoDecoder.seek_frame() (BAGIAN 2) yang satu-satu & scaler-nya
+/// terpatok ukuran asli video -- di sini scaler dibikin SEKALI di ukuran
+/// thumbnail (bisa diresize via `max_width`) lalu dipakai ulang buat semua
+/// posisi, jadi jauh lebih murah buat generate banyak sekaligus (mis. buat
+/// grid preview di file browser Macan Movie Pro).
+///
+/// Balikin list `(array_rgb, pts_detik)`. Thumbnail yang gagal di-seek/decode
+/// (kadang kejadian di file yang korup sebagian) dilewatin diam-diam, BUKAN
+/// bikin seluruh fungsi gagal -- lebih baik dapet grid yang bolong dikit
+/// drpd gagal total gara-gara 1 dari N thumbnail bermasalah.
+#[pyfunction]
+#[pyo3(signature = (file_path, count, max_width=None))]
+fn generate_thumbnails(
+    py: Python<'_>,
+    file_path: &str,
+    count: usize,
+    max_width: Option<u32>,
+) -> PyResult<Vec<(Py<PyArray3<u8>>, f64)>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    init_ffmpeg()?;
+
+    let path = Path::new(file_path);
+    let mut input_ctx = ffmpeg_next::format::input(&path)
+        .map_err(|e| PyIOError::new_err(format!("Buka file: {}", e)))?;
+    let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Video)
+        .ok_or_else(|| PyValueError::new_err("Tidak ada aliran video"))?;
+    let stream_idx = stream.index();
+    let time_base = rational_to_f64(stream.time_base());
+    let duration = stream.duration() as f64 * time_base;
+
+    let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
+    let mut decoder = ctx.decoder().video()
+        .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder: {}", e)))?;
+    let src_format = decoder.format();
+    let (src_w, src_h) = (decoder.width(), decoder.height());
+
+    if duration <= 0.0 || src_w == 0 || src_h == 0 {
+        return Err(PyValueError::new_err("Durasi/dimensi video tidak valid, gak bisa generate thumbnail"));
+    }
+
+    // Hitung dimensi thumbnail -- jaga aspect ratio, dibulatin ke genap
+    // (banyak scaler/pixel format gak suka dimensi ganjil).
+    let (dst_w, dst_h) = match max_width {
+        Some(mw) if mw > 0 && mw < src_w => {
+            let ratio = mw as f64 / src_w as f64;
+            let h = (((src_h as f64 * ratio) as u32) & !1).max(2);
+            (mw & !1, h)
+        }
+        _ => (src_w, src_h),
+    };
+
+    let mut scaler = ffmpeg_next::software::scaling::Context::get(
+        src_format, src_w, src_h,
+        ffmpeg_next::util::format::Pixel::RGB24, dst_w, dst_h,
+        ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+    ).map_err(|e| PyRuntimeError::new_err(format!("Buat scaler thumbnail: {}", e)))?;
+
+    let mut results: Vec<(Py<PyArray3<u8>>, f64)> = Vec::with_capacity(count);
+    let mut decoded = ffmpeg_next::frame::Video::empty();
+
+    for i in 0..count {
+        let second = duration * (i as f64 + 0.5) / count as f64;
+        let seek_ts = av_time_base_ts(second);
+        let target_ts = (second / time_base).round() as i64;
+
+        if input_ctx.seek(seek_ts, ..seek_ts).is_err() {
+            continue; // lewatin thumbnail ini, jangan gagalin semuanya
+        }
+        decoder.flush();
+
+        let mut got_frame = false;
+        let mut packet_count = 0;
+        'search: for (s, packet) in input_ctx.packets() {
+            if packet_count > 200 { break; }
+            if s.index() != stream_idx {
+                packet_count += 1;
+                continue;
+            }
+            if decoder.send_packet(&packet).is_err() {
+                packet_count += 1;
+                continue;
+            }
+            while decoder.receive_frame(&mut decoded).is_ok() {
+                got_frame = true;
+                if decoded.timestamp().unwrap_or(0) >= target_ts {
+                    break 'search;
+                }
+            }
+            packet_count += 1;
+        }
+        if !got_frame {
+            continue;
+        }
+
+        let mut rgb_frame = ffmpeg_next::frame::Video::new(
+            ffmpeg_next::util::format::Pixel::RGB24, dst_w, dst_h,
+        );
+        if scaler.run(&decoded, &mut rgb_frame).is_err() {
+            continue;
+        }
+
+        let stride = rgb_frame.stride(0);
+        let row_width = (dst_w as usize) * 3;
+        let mut data = Vec::with_capacity((dst_h as usize) * row_width);
+        let raw = rgb_frame.data(0);
+        for y in 0..(dst_h as usize) {
+            let start = y * stride;
+            data.extend_from_slice(&raw[start..start + row_width]);
+        }
+
+        let arr = match Array3::from_shape_vec((dst_h as usize, dst_w as usize, 3), data) {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        results.push((arr.into_pyarray(py).into(), second));
+    }
+
+    Ok(results)
+}
+
+/// [BARU] Analisa loudness kasar (peak & RMS, dalam dBFS) buat 1 file
+/// audio. Cocok buat fitur "normalize volume" di audio cutter/tag editor
+/// atau converter -- BUKAN pengukuran EBU R128 LUFS presisi broadcast,
+/// tapi cukup buat kebutuhan normalisasi umum aplikasi desktop (mis.
+/// hitung berapa dB gain yang perlu ditambahin biar peak nyentuh -1dBFS).
+///
+/// Balikin `(peak_db, rms_db)`. Keduanya negatif atau 0 (0 dBFS = full
+/// scale, makin negatif makin pelan).
+#[pyfunction]
+fn analyze_loudness(file_path: &str) -> PyResult<(f32, f32)> {
+    let samples = decode_audio_mono(file_path, 44100)?;
+    if samples.is_empty() {
+        return Err(PyValueError::new_err("Tidak ada sample audio yang bisa dibaca dari file ini"));
+    }
+
+    let peak = samples.par_iter().map(|s| s.abs()).reduce(|| 0.0f32, f32::max);
+    let sum_sq: f32 = samples.par_iter().map(|s| s * s).sum();
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+
+    // Floor -120dB biar file yang beneran diem total (peak=0.0) gak
+    // ngasilin log10(0) = -inf, yang bakal bikin masalah kalau nilainya
+    // dipake buat kalkulasi gain di sisi Python (mis. -inf + apapun = -inf).
+    let peak_db = 20.0 * peak.max(1e-6).log10();
+    let rms_db = 20.0 * rms.max(1e-6).log10();
+    Ok((peak_db, rms_db))
+}
+
+// ═══════════════════════════════════════════════
 // DAFTARKAN KE MODUL
 // ═══════════════════════════════════════════════
 
@@ -1246,5 +2331,9 @@ fn media_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MediaInfo>()?;
     m.add_class::<VideoDecoder>()?;
     m.add_class::<PlayerEngine>()?;
+    m.add_function(wrap_pyfunction!(analyze_waveform, m)?)?;
+    m.add_function(wrap_pyfunction!(convert_media, m)?)?;
+    m.add_function(wrap_pyfunction!(generate_thumbnails, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_loudness, m)?)?;
     Ok(())
 }
