@@ -20,7 +20,7 @@ jobs:
       # mau naik ke FFmpeg 7.1, naikkan juga `ffmpeg-next` (dan
       # `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support 7.1
       # secara eksplisit, jangan cuma ganti tag ini sendirian.
-      FFMPEG_TAG: n7.0
+      FFMPEG_TAG: n7.1
 
     steps:
       - uses: actions/checkout@v4
