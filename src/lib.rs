@@ -1842,9 +1842,21 @@ fn needs_global_header(octx: &ffmpeg_next::format::context::Output) -> bool {
 /// dikit antar versi minor ffmpeg-next -- kalau `cargo check` komplen di
 /// bagian ini, cek `cargo doc --open -p ffmpeg-next` dulu match sama versi
 /// 7.1 yang kepasang, jangan asal tebak nama method-nya.
+/// [BARU] `progress_callback`: opsional, callable Python `fn(percent: f64)`
+/// yang dipanggil berkala (di-throttle ~tiap progress maju 0.5%) selama
+/// proses berjalan, plus sekali terakhir dengan `100.0` pas selesai. Dipakai
+/// AudioConversionWorker (macan_audio_converter.py) buat nge-update progress
+/// bar beneran, gantiin behavior lama yang cuma lompat 0% -> 100%. Persentase
+/// dihitung dari posisi pts packet TERBARU yang diproses dibanding total
+/// durasi (atau rentang trim_start/trim_end kalau dipakai) -- estimasi
+/// berbasis timestamp container, bukan progress encoder yang presisi, tapi
+/// cukup akurat buat UI progress bar. Kalau durasi gak diketahui (mis. live
+/// stream/container aneh), callback gak pernah dipanggil sama sekali --
+/// caller sebaiknya fallback ke indikator "sedang berjalan" tanpa persentase.
 #[pyfunction]
-#[pyo3(signature = (input_path, output_path, video_codec=None, audio_codec=None, video_bitrate=None, audio_bitrate=None, drop_video=false, drop_audio=false, trim_start=None, trim_end=None))]
+#[pyo3(signature = (input_path, output_path, video_codec=None, audio_codec=None, video_bitrate=None, audio_bitrate=None, drop_video=false, drop_audio=false, trim_start=None, trim_end=None, progress_callback=None))]
 fn convert_media(
+    py: Python<'_>,
     input_path: &str,
     output_path: &str,
     video_codec: Option<&str>,
@@ -1855,6 +1867,7 @@ fn convert_media(
     drop_audio: bool,
     trim_start: Option<f64>,
     trim_end: Option<f64>,
+    progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     init_ffmpeg()?;
 
@@ -1872,6 +1885,27 @@ fn convert_media(
     if vidx.is_none() && aidx.is_none() {
         return Err(PyValueError::new_err("Tidak ada track video/audio yang bisa dikonversi (cek drop_video/drop_audio)"));
     }
+
+    // [BARU] Total durasi (detik) buat basis hitung persentase progress.
+    // `ictx.duration()` balikin AV_TIME_BASE units (mikrodetik) di
+    // ffmpeg-next, <= 0 kalau gak diketahui (container tanpa duration
+    // header, live stream, dll) -- di kasus itu progress_span jadi 0.0 dan
+    // callback progress otomatis gak pernah kepanggil sama sekali di bawah.
+    let total_duration_secs: f64 = {
+        let d = ictx.duration();
+        if d > 0 { d as f64 / 1_000_000.0 } else { 0.0 }
+    };
+    // Kalau trim aktif, progress dihitung relatif ke rentang trim_start..
+    // trim_end (bukan 0..total_duration) -- biar progress bar gak "nyangkut"
+    // di 0% lama pas trim_start jauh dari awal, atau gak pernah nyampe 100%
+    // kalau trim_end < total_duration.
+    let progress_offset = trim_start.unwrap_or(0.0);
+    let progress_span = match (trim_start, trim_end) {
+        (_, Some(end)) if end > progress_offset => end - progress_offset,
+        _ if total_duration_secs > progress_offset => total_duration_secs - progress_offset,
+        _ => 0.0,
+    };
+    let mut last_reported_pct: f64 = -1.0; // -1 biar laporan pertama (0%) pasti kekirim
 
     if let Some(start) = trim_start {
         // Seek demuxer sebelum mulai baca paket. Cuma "ancang-ancang" ke
@@ -2089,6 +2123,23 @@ fn convert_media(
         // fokus audio/video doang, sama kayak scope Macan Converter yang
         // sekarang.
 
+        // [BARU] Report progress berdasarkan posisi pts packet TERBARU yang
+        // baru diproses. Di-throttle: cuma manggil balik ke Python (call1,
+        // yang jalan minimal 1 alokasi + acquire ke Python bytecode eval)
+        // kalau progress udah maju >= 0.5% dari laporan sebelumnya --
+        // tanpa throttle ini, file yang banyak paketnya bisa manggil
+        // callback ribuan kali/detik dan bikin overhead gak perlu.
+        if let (Some(cb), true) = (progress_callback.as_ref(), progress_span > 0.0) {
+            if let Some(ts) = packet.pts().or_else(|| packet.dts()) {
+                let sec = ts as f64 * rational_to_f64(stream.time_base());
+                let pct = ((sec - progress_offset) / progress_span * 100.0).clamp(0.0, 100.0);
+                if pct - last_reported_pct >= 0.5 {
+                    last_reported_pct = pct;
+                    let _ = cb.call1(py, (pct,));
+                }
+            }
+        }
+
         // [BARU] Kalau trim_end dipasang, tiap line nandain dirinya
         // `done` begitu ngelewatin trim_end. Begitu SEMUA line yang
         // aktif udah done, berhenti demux -- gak perlu baca sisa file.
@@ -2109,6 +2160,15 @@ fn convert_media(
 
     octx.write_trailer()
         .map_err(|e| PyRuntimeError::new_err(format!("Tulis trailer output: {}", e)))?;
+
+    // [BARU] Laporan terakhir -- pastikan UI selalu nampilin persis 100%
+    // pas selesai, walau pts packet terakhir yang ke-throttle di atas
+    // kebetulan berhenti sebelum benar-benar nyentuh progress_span penuh
+    // (mis. karena rounding, atau container yang durasi headernya meleset
+    // dikit dari total pts paket sebenarnya).
+    if let Some(cb) = progress_callback.as_ref() {
+        let _ = cb.call1(py, (100.0_f64,));
+    }
 
     Ok(())
 }
