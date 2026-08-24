@@ -57,14 +57,14 @@ jobs:
       - name: Pasang Meson & Ninja (buat libdav1d)
         run: pip install meson ninja
 
-      # 💾 [BARU] Cache hasil build statis FFmpeg (+ libdav1d + libmp3lame)
-      # antar-run. Compile FULL FFmpeg dari nol (semua codec/format aktif,
-      # gak dibatasi --disable-everything) di runner 2 core kadang mepet/
-      # lewat batas timeout 40 menit -- ini salah satu penyebab build
-      # "kadang gagal kadang enggak" tanpa error yang konsisten. Key cache
-      # ikut FFMPEG_TAG + isi konfigurasi cross-compile (lewat hash file ini
-      # sendiri), jadi otomatis invalidate kalau tag/flag configure di atas
-      # diubah.
+      # 💾 [BARU] Cache hasil build statis FFmpeg (+ libdav1d + libmp3lame +
+      # libogg + libvorbis) antar-run. Compile FULL FFmpeg dari nol (semua
+      # codec/format aktif, gak dibatasi --disable-everything) di runner
+      # 2 core kadang mepet/lewat batas timeout 40 menit -- ini salah satu
+      # penyebab build "kadang gagal kadang enggak" tanpa error yang
+      # konsisten. Key cache ikut FFMPEG_TAG + isi konfigurasi cross-compile
+      # (lewat hash file ini sendiri), jadi otomatis invalidate kalau
+      # tag/flag configure di atas diubah.
       #
       # [FIX] Step ini SENGAJA dipindah ke atas, SEBELUM step libdav1d &
       # libmp3lame di bawah. Sebelumnya step ini ada di bawah step libdav1d,
@@ -79,7 +79,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v4-mp3lame-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v18-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -135,7 +135,54 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      # 🎬 ffmpeg-sys-next 7.x salah kirim --target_os=windows ke `configure`
+      # 🎵 [BARU] Kompilasi libogg + libvorbis statis (cross ke Windows).
+      # Sama seperti kasus libmp3lame: FFmpeg gak punya native OGG/Vorbis
+      # encoder, satu-satunya jalan encode ke .ogg itu lewat libvorbis
+      # (yang sendirinya butuh libogg buat container-nya). Tanpa dua lib
+      # ini, "ogg" -> "libvorbis" di AUDIO_CODEC_BY_FORMAT
+      # (macan_audio_converter.py) bakal gagal runtime dengan error yang
+      # persis sama kelasnya kayak libmp3lame kemarin.
+      #
+      # Beda dengan LAME, libogg & libvorbis (autotools, bukan Meson) SAMA-
+      # SAMA generate file .pc (ogg.pc, vorbis.pc, vorbisenc.pc) pas
+      # `make install` -- jadi cukup diarahkan lewat PKG_CONFIG_PATH,
+      # gak perlu --extra-cflags/--extra-ldflags manual kayak lame.
+      # Urutan WAJIB: libogg dulu baru libvorbis (libvorbis --with-ogg
+      # butuh libogg sudah ke-install di prefix yang sama).
+      - name: 🎵 Kompilasi libogg statis (cross ke Windows)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o libogg.tar.gz "https://downloads.xiph.org/releases/ogg/libogg-1.3.5.tar.gz"
+          tar xzf libogg.tar.gz
+          cd libogg-1.3.5
+
+          ./configure \
+            --prefix="$HOME/ffmpeg-windows" \
+            --host=x86_64-w64-mingw32 \
+            --disable-shared \
+            --enable-static
+
+          make -j"$(nproc)"
+          make install
+
+      - name: 🎵 Kompilasi libvorbis statis (cross ke Windows)
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          export PKG_CONFIG_PATH="$HOME/ffmpeg-windows/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+          curl -L -o libvorbis.tar.gz "https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.gz"
+          tar xzf libvorbis.tar.gz
+          cd libvorbis-1.3.7
+
+          ./configure \
+            --prefix="$HOME/ffmpeg-windows" \
+            --host=x86_64-w64-mingw32 \
+            --with-ogg="$HOME/ffmpeg-windows" \
+            --disable-shared \
+            --enable-static
+
+          make -j"$(nproc)"
+          make install
       # FFmpeg pas dia yang nge-drive proses cross-compile ("Unknown OS
       # 'windows'"). Makanya FFmpeg dikompilasi manual di sini dengan
       # --target-os=mingw32 yang benar, lalu ffmpeg-sys-next tinggal diarahkan
@@ -183,6 +230,7 @@ jobs:
             --disable-mediafoundation \
             --enable-libdav1d \
             --enable-libmp3lame \
+            --enable-libvorbis \
             --extra-cflags="-I$HOME/ffmpeg-windows/include" \
             --extra-ldflags="-L$HOME/ffmpeg-windows/lib" \
             --pkg-config="pkg-config --static" 
@@ -194,8 +242,8 @@ jobs:
       # supaya tetap ke-set dengan benar walau step compile di atas di-skip
       # karena cache-hit -- sebelumnya env ini cuma di-export kalau step
       # compile benar-benar jalan.
-     # - name: Set FFMPEG_DIR
-        #run: echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
+      - name: Set FFMPEG_DIR
+        run: echo "FFMPEG_DIR=$HOME/ffmpeg-windows" >> "$GITHUB_ENV"
 
       - name: Pasang Python (host, buat jalanin maturin)
         uses: actions/setup-python@v5
@@ -209,25 +257,45 @@ jobs:
           pip install maturin
 
       # 🔧 Cargo perlu tau linker mana yang dipakai buat target windows-gnu.
-      #- name: Setup linker cargo buat target windows-gnu
-        #run: |
-          #mkdir -p .cargo
-          #cat >> .cargo/config.toml <<'EOF'
-          #[target.x86_64-pc-windows-gnu]
-          #linker = "x86_64-w64-mingw32-gcc"
-          #ar = "x86_64-w64-mingw32-ar"
-          #rustflags = [
-              #"-C", "link-arg=-lws2_32",
-              #"-C", "link-arg=-lbcrypt",
-              #"-C", "link-arg=-luser32",
-              #"-C", "link-arg=-lsecur32",
-              #"-C", "link-arg=-lole32",
-              #"-C", "link-arg=-lcrypt32",
-              #"-C", "link-arg=-ldav1d",
-              #"-C", "link-arg=-lmp3lame",
-              #"-C", "link-arg=-lkernel32"
-          #]
-          #EOF
+      - name: Setup linker cargo buat target windows-gnu
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.x86_64-pc-windows-gnu]
+          linker = "x86_64-w64-mingw32-gcc"
+          ar = "x86_64-w64-mingw32-ar"
+          rustflags = [
+              "-C", "link-arg=-lws2_32",
+              "-C", "link-arg=-lbcrypt",
+              "-C", "link-arg=-luser32",
+              "-C", "link-arg=-lsecur32",
+              "-C", "link-arg=-lole32",
+              "-C", "link-arg=-lcrypt32",
+              # [FIX] Bungkus lib statis kita + runtime mingw pakai
+              # --start-group/--end-group. `ld` itu single-pass (scan kiri
+              # ke kanan sekali doang) -- tanpa group ini, `-lmp3lame` di
+              # ujung command butuh simbol libc/libm (powf, sqrt, strcat,
+              # fflush, ftell, __mingw_vsprintf, __imp_toupper dst) yang
+              # ada di `-lmsvcrt`/`-lmingwex`, TAPI kedua lib itu sudah
+              # "kelewat" diproses duluan (posisinya di depan command,
+              # sebelum -l custom kita) -> ld gak balik nyari lagi ->
+              # "undefined reference" walau fungsinya sebenarnya ada.
+              # Dengan --start-group/--end-group, ld looping ulang di
+              # dalam grup ini sampai semua simbol ke-resolve -- jadi juga
+              # future-proof kalau nanti nambah lib statis lain lagi
+              # (mis. libopus), gak perlu mikirin urutan manual per lib.
+              "-C", "link-arg=-Wl,--start-group",
+              "-C", "link-arg=-ldav1d",
+              "-C", "link-arg=-lmp3lame",
+              "-C", "link-arg=-lvorbisenc",
+              "-C", "link-arg=-lvorbis",
+              "-C", "link-arg=-logg",
+              "-C", "link-arg=-lmingwex",
+              "-C", "link-arg=-lmsvcrt",
+              "-C", "link-arg=-lkernel32",
+              "-C", "link-arg=-Wl,--end-group"
+          ]
+          EOF
 
       # ⚙️ FFmpeg udah dikompilasi manual di step sebelumnya dan diarahkan
       # lewat FFMPEG_DIR (env, sudah di-export ke $GITHUB_ENV). ffmpeg-sys-next
@@ -236,9 +304,7 @@ jobs:
         timeout-minutes: 30
         env:
           FFMPEG_SYS_NEXT_NO_VCPKG: "1"
-          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "1" # [FIX] Enable pkg-config
-          PKG_CONFIG_ALLOW_CROSS: "1"         # [FIX] Allow cross-compilation
-          PKG_CONFIG_PATH: "/home/runner/ffmpeg-windows/lib/pkgconfig"
+          FFMPEG_SYS_NEXT_USE_PKG_CONFIG: "0"
         run: maturin build --release --target x86_64-pc-windows-gnu --out dist -vv
 
       # 🩺 Kalau step kompilasi FFmpeg manual di atas gagal, config.log-nya
