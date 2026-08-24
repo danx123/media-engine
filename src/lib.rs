@@ -1043,6 +1043,13 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     // `Option` di sini biar gampang "dilepas" (di-None-in) pas mau seek --
     // seek() butuh &mut input_ctx eksklusif, gak bisa dipinjem bareng
     // sama iterator yang masih hidup.
+    // [FIX] `#[allow(unused_assignments)]` -- rustc nganggep `packet_iter =
+    // None;` di bawah "gak pernah dibaca" karena langsung ditimpa lagi sama
+    // `Some(...)`, padahal assignment ke None itu SENGAJA: itu yang bikin
+    // borrow ke `input_ctx` dari iterator lama dilepas sebelum `seek()`
+    // dipanggil. Efek sampingnya (drop borrow) penting, bukan nilainya --
+    // jadi warning-nya false-positive, cukup di-silence, gak perlu direstruktur.
+    #[allow(unused_assignments)]
     let mut packet_iter = Some(input_ctx.packets());
 
     loop {
@@ -1378,6 +1385,9 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
     // Sama kayak video_decode_loop: SATU iterator, dipakai berulang, cuma
     // dibikin ulang pas ada seek. Lihat comment lebih lengkap di
     // video_decode_loop soal kenapa ini penting.
+    // [FIX] Sama kayak di video_decode_loop -- assignment ke None di bawah
+    // sengaja buat lepas borrow sebelum seek(), bukan gak kepake.
+    #[allow(unused_assignments)]
     let mut packet_iter = Some(input_ctx.packets());
 
     loop {
@@ -2002,6 +2012,11 @@ fn convert_media(
                 .map_err(|e| PyRuntimeError::new_err(format!("Buka encoder audio: {}", e)))?;
             ost.set_parameters(&encoder);
 
+            // [BARU] Ambil jumlah channel encoder SEBELUM `encoder` dipindah
+            // (moved) ke dalam AudioTranscodeMode::Encode di bawah -- dipakai
+            // buat inisialisasi AudioFifo.
+            let enc_channels = encoder.channels() as usize;
+
             let resampler = ffmpeg_next::software::resampling::Context::get(
                 decoder.format(), decoder.channel_layout(), decoder.rate(),
                 encoder.format(), encoder.channel_layout(), encoder.rate(),
@@ -2019,6 +2034,8 @@ fn convert_media(
                 done: false,
                 mode: AudioTranscodeMode::Encode {
                     decoder, encoder, resampler,
+                    fifo: AudioFifo::new(enc_channels),
+                    next_pts: 0,
                 },
             });
         } else {
@@ -2208,12 +2225,80 @@ impl VideoLine {
     }
 }
 
+/// [BARU] Buffer sample audio antar frame resampled -> encoder frame_size.
+/// Root cause bug "Kirim frame audio ke encoder: Invalid argument" pas
+/// convert m4a(AAC) -> mp3: decoder AAC menghasilkan 1024 sample/frame,
+/// TAPI libmp3lame WAJIB persis 1152 sample per frame (kecuali frame
+/// terakhir) -- ini bukan variable-frame-size codec. Kirim frame dengan
+/// nb_samples yang gak match avctx->frame_size bikin avcodec_send_frame()
+/// balikin AVERROR(EINVAL) alias "Invalid argument". Kebetulan mp3->mp3
+/// "kerja" karena decode MP3 juga persis 1152 sample/frame, jadi gak
+/// pernah nabrak masalah rechunking ini.
+///
+/// FIFO ini nampung sample float32 per-channel-plane (encoder SELALU
+/// dikonfigurasi format F32 Planar, lihat setup di bawah), lalu ngeluarin
+/// chunk PERSIS `frame_size` sample tiap kali cukup -- generik buat semua
+/// encoder (frame_size==0 buat codec variable-size kayak PCM ditangani
+/// terpisah, lihat drain_fifo()).
+struct AudioFifo {
+    channels: usize,
+    buf: Vec<Vec<f32>>,
+}
+
+impl AudioFifo {
+    fn new(channels: usize) -> Self {
+        AudioFifo { channels, buf: (0..channels).map(|_| Vec::new()).collect() }
+    }
+
+    /// Salin seluruh sample dari 1 frame F32 Planar ke buffer internal.
+    fn push(&mut self, frame: &ffmpeg_next::frame::Audio) {
+        if frame.samples() == 0 {
+            return;
+        }
+        for ch in 0..self.channels.min(frame.planes()) {
+            let plane: &[f32] = frame.plane(ch);
+            self.buf[ch].extend_from_slice(plane);
+        }
+    }
+
+    /// Jumlah sample yang siap diambil (sama buat semua channel).
+    fn available(&self) -> usize {
+        self.buf.first().map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Ambil persis `n` sample per channel (n <= available()), bikin frame
+    /// F32 Planar baru buat dikirim ke encoder.
+    fn pop_frame(
+        &mut self,
+        n: usize,
+        layout: ffmpeg_next::util::channel_layout::ChannelLayout,
+        rate: u32,
+    ) -> ffmpeg_next::frame::Audio {
+        let mut out = ffmpeg_next::frame::Audio::new(
+            ffmpeg_next::util::format::Sample::F32(ffmpeg_next::util::format::sample::Type::Planar),
+            n,
+            layout,
+        );
+        out.set_rate(rate);
+        for ch in 0..self.channels {
+            let dst: &mut [f32] = out.plane_mut(ch);
+            dst.copy_from_slice(&self.buf[ch][..n]);
+            self.buf[ch].drain(..n);
+        }
+        out
+    }
+}
+
 enum AudioTranscodeMode {
     Copy,
     Encode {
         decoder: ffmpeg_next::decoder::Audio,
         encoder: ffmpeg_next::encoder::Audio,
         resampler: ffmpeg_next::software::resampling::Context,
+        // [BARU] Lihat AudioFifo -- rechunk sample resampled ke persis
+        // encoder.frame_size() sebelum di-encoder.send_frame().
+        fifo: AudioFifo,
+        next_pts: i64,
     },
 }
 
@@ -2258,17 +2343,28 @@ impl AudioLine {
                 packet.write_interleaved(octx)
                     .map_err(|e| PyRuntimeError::new_err(format!("Tulis paket audio: {}", e)))?;
             }
-            AudioTranscodeMode::Encode { decoder, encoder, resampler } => {
+            AudioTranscodeMode::Encode { decoder, encoder, resampler, fifo, next_pts } => {
                 decoder.send_packet(packet)
                     .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket audio ke decoder: {}", e)))?;
                 let mut decoded = ffmpeg_next::frame::Audio::empty();
                 while decoder.receive_frame(&mut decoded).is_ok() {
                     let mut resampled = ffmpeg_next::frame::Audio::empty();
                     if resampler.run(&decoded, &mut resampled).is_ok() {
-                        resampled.set_pts(decoded.pts());
-                        encoder.send_frame(&resampled)
-                            .map_err(|e| PyRuntimeError::new_err(format!("Kirim frame audio ke encoder: {}", e)))?;
-                        Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                        // [FIX] JANGAN langsung encoder.send_frame(&resampled)
+                        // -- jumlah sample hasil resample (ngikutin ukuran
+                        // frame decoder, mis. 1024 buat AAC) belum tentu
+                        // sama dengan encoder.frame_size() (mis. 1152 buat
+                        // mp3). Numpuk dulu ke fifo, baru kirim per-chunk
+                        // persis frame_size (lihat AudioFifo di atas).
+                        fifo.push(&resampled);
+                        let frame_size = encoder.frame_size() as usize;
+                        let layout = encoder.channel_layout();
+                        let rate = encoder.rate();
+                        Self::drain_fifo(
+                            fifo, encoder, frame_size, false,
+                            layout, rate, next_pts,
+                            self.out_index, self.out_tb, octx,
+                        )?;
                     }
                 }
             }
@@ -2292,18 +2388,99 @@ impl AudioLine {
         Ok(())
     }
 
+    /// [BARU] Kosongin AudioFifo -> kirim ke encoder dalam chunk yang PAS
+    /// buat codec ini. Dua mode:
+    ///   - frame_size > 0 (mis. mp3=1152, aac=1024): kirim per-chunk PERSIS
+    ///     frame_size sample. Sisa < frame_size dibiarkan numpuk di fifo
+    ///     KECUALI `force_final` true (dipanggil pas flush/EOF) -- baru di
+    ///     situ sisa terakhir ini dikirim sebagai frame lebih kecil (encoder
+    ///     modern umumnya support CODEC_CAP_SMALL_LAST_FRAME buat kasus ini,
+    ///     termasuk mp3/aac/vorbis).
+    ///   - frame_size == 0 (mis. pcm_s16le, "variable frame size"): gak ada
+    ///     yang perlu di-rechunk, langsung kosongin semua yang numpuk jadi
+    ///     satu frame apa adanya, sama kayak perilaku lama.
+    fn drain_fifo(
+        fifo: &mut AudioFifo,
+        encoder: &mut ffmpeg_next::encoder::Audio,
+        frame_size: usize,
+        force_final: bool,
+        layout: ffmpeg_next::util::channel_layout::ChannelLayout,
+        rate: u32,
+        next_pts: &mut i64,
+        out_index: usize,
+        out_tb: ffmpeg_next::Rational,
+        octx: &mut ffmpeg_next::format::context::Output,
+    ) -> PyResult<()> {
+        if frame_size == 0 {
+            let n = fifo.available();
+            if n > 0 {
+                let mut out_frame = fifo.pop_frame(n, layout, rate);
+                out_frame.set_pts(Some(*next_pts));
+                *next_pts += n as i64;
+                encoder.send_frame(&out_frame)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Kirim frame audio ke encoder: {}", e)))?;
+                Self::drain_encoder(encoder, out_index, out_tb, octx)?;
+            }
+            return Ok(());
+        }
+
+        while fifo.available() >= frame_size {
+            let mut out_frame = fifo.pop_frame(frame_size, layout, rate);
+            out_frame.set_pts(Some(*next_pts));
+            *next_pts += frame_size as i64;
+            encoder.send_frame(&out_frame)
+                .map_err(|e| PyRuntimeError::new_err(format!("Kirim frame audio ke encoder: {}", e)))?;
+            Self::drain_encoder(encoder, out_index, out_tb, octx)?;
+        }
+
+        if force_final {
+            let n = fifo.available();
+            if n > 0 {
+                let mut out_frame = fifo.pop_frame(n, layout, rate);
+                out_frame.set_pts(Some(*next_pts));
+                *next_pts += n as i64;
+                // best-effort, sama kayak flush() lain di file ini (`let _ =`)
+                // -- codec yang gak support small-last-frame tinggal drop
+                // sisa < 1 frame_size ini, bukan hard error pas aplikasi
+                // lagi exit/selesai.
+                let _ = encoder.send_frame(&out_frame);
+                Self::drain_encoder(encoder, out_index, out_tb, octx)?;
+            }
+        }
+        Ok(())
+    }
+
     fn flush(&mut self, octx: &mut ffmpeg_next::format::context::Output) -> PyResult<()> {
-        if let AudioTranscodeMode::Encode { decoder, encoder, resampler } = &mut self.mode {
+        if let AudioTranscodeMode::Encode { decoder, encoder, resampler, fifo, next_pts } = &mut self.mode {
             let _ = decoder.send_eof();
             let mut decoded = ffmpeg_next::frame::Audio::empty();
             while decoder.receive_frame(&mut decoded).is_ok() {
                 let mut resampled = ffmpeg_next::frame::Audio::empty();
                 if resampler.run(&decoded, &mut resampled).is_ok() {
-                    resampled.set_pts(decoded.pts());
-                    let _ = encoder.send_frame(&resampled);
-                    Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
+                    fifo.push(&resampled);
+                    let frame_size = encoder.frame_size() as usize;
+                    let layout = encoder.channel_layout();
+                    let rate = encoder.rate();
+                    Self::drain_fifo(
+                        fifo, encoder, frame_size, false,
+                        layout, rate, next_pts,
+                        self.out_index, self.out_tb, octx,
+                    )?;
                 }
             }
+            // [FIX] Kosongin sisa terakhir yang numpuk di fifo (< frame_size,
+            // gak akan pernah lolos syarat `fifo.available() >= frame_size`
+            // di loop normal manapun) SEBELUM encoder.send_eof() -- tanpa
+            // ini, ekor terakhir audio (< 1 frame_size sample) bakal ke-drop
+            // diam-diam alih-alih ikut ke-encode.
+            let frame_size = encoder.frame_size() as usize;
+            let layout = encoder.channel_layout();
+            let rate = encoder.rate();
+            Self::drain_fifo(
+                fifo, encoder, frame_size, true,
+                layout, rate, next_pts,
+                self.out_index, self.out_tb, octx,
+            )?;
             let _ = encoder.send_eof();
             Self::drain_encoder(encoder, self.out_index, self.out_tb, octx)?;
         }
