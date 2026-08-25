@@ -34,6 +34,17 @@ fn init_ffmpeg() -> PyResult<()> {
     ffmpeg_next::init().map_err(|e| {
         PyRuntimeError::new_err(format!("Inisialisasi FFmpeg gagal: {}", e))
     })?;
+
+    // [BARU] Wajib buat protokol jaringan (http/https/icecast dll) --
+    // tanpa ini, `ffmpeg_next::format::input()` cuma bisa buka file lokal.
+    // PlayerEngine (dipakai macan_radio.py buat stream radio & macan
+    // audio player buat podcast) butuh ini biar bisa buka URL langsung.
+    // avformat_network_init() sendiri aman dipanggil berkali-kali (FFmpeg
+    // nge-refcount init-nya secara internal), jadi gak perlu guard tambahan
+    // walau init_ffmpeg() ini kepanggil tiap kali PlayerEngine/MediaInfo/
+    // AudioInfo baru dibikin.
+    ffmpeg_next::format::network::init();
+
     Ok(())
 }
 
