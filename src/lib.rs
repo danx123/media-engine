@@ -138,6 +138,7 @@ impl MediaInfo {
 #[pyclass]
 struct AudioInfo {
     #[pyo3(get)] path: String,
+    #[pyo3(get)] duration: f64,
     #[pyo3(get)] codec: String,
     #[pyo3(get)] codec_id: String,
     #[pyo3(get)] sample_rate: u32,
@@ -165,6 +166,24 @@ impl AudioInfo {
             .map(|c| c.description().to_string())
             .unwrap_or_else(|| "Tidak diketahui".to_string());
 
+        // [BARU] Durasi -- diambil dari stream audio dulu (pola sama kayak
+        // MediaInfo buat video), lalu fallback ke durasi container
+        // (`input.duration()`, satuan AV_TIME_BASE/mikrodetik) kalau
+        // per-stream-nya gak ke-isi (kejadian di beberapa format kayak MP3
+        // CBR tanpa header durasi eksplisit per-stream). Dipakai gantiin
+        // subprocess `ffprobe` di audio_cutter.py/advanced_tag_editorv87.py
+        // (lihat _ffprobe_duration) -- baca langsung dari header lewat
+        // binding yang udah ke-link di proses yang sama, bukan ffprobe
+        // yang di-timeout sampai 8 detik dan nge-spawn proses baru.
+        let tb = stream.time_base();
+        let tb_f64 = if tb.denominator() > 0 { tb.numerator() as f64 / tb.denominator() as f64 } else { 0.0 };
+        let stream_duration = stream.duration() as f64 * tb_f64;
+        let duration = if stream_duration > 0.0 {
+            stream_duration
+        } else {
+            (input.duration() as f64 / 1_000_000.0).max(0.0)
+        };
+
         let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
 
@@ -188,14 +207,14 @@ impl AudioInfo {
 
         Ok(AudioInfo {
             path: file_path.to_string(),
-            codec, codec_id, sample_rate, channels, bitrate,
+            duration, codec, codec_id, sample_rate, channels, bitrate,
         })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "AudioInfo({}, {} {}Hz {}ch, bitrate={}bps)",
-            self.codec_id, self.codec, self.sample_rate, self.channels, self.bitrate
+            "AudioInfo(dur={:.2}s, {}, {} {}Hz {}ch, bitrate={}bps)",
+            self.duration, self.codec_id, self.codec, self.sample_rate, self.channels, self.bitrate
         )
     }
 }
@@ -521,6 +540,16 @@ struct PlayerEngine {
     #[pyo3(get)] height: u32,
     #[pyo3(get)] fps: f64,
     #[pyo3(get)] has_audio: bool,
+    // [BARU] True kalau file punya stream video. Dulu PlayerEngine cuma bisa
+    // dipakai buat file yang PASTI ada videonya (constructor gagal keras
+    // kalau gak nemu stream video) -- itu bikin dia gak bisa dipakai buat
+    // playback file AUDIO MURNI (mp3/flac/wav/dll) kayak yang dipakai
+    // audio_cutter.py & advanced_tag_editorv87.py (dulu masih pakai
+    // QMediaPlayer/QAudioOutput dari QtMultimedia buat kasus ini). Sekarang
+    // video jadi opsional: kalau gak ada stream video, width/height/fps
+    // dikosongin (0) dan has_video = false, TAPI decode+playback AUDIO
+    // tetep jalan normal lewat audio_decode_loop() seperti biasa.
+    #[pyo3(get)] has_video: bool,
 }
 
 #[pymethods]
@@ -533,23 +562,63 @@ impl PlayerEngine {
         let probe = ffmpeg_next::format::input(&path)
             .map_err(|e| PyIOError::new_err(format!("Buka file: {}", e)))?;
 
-        let vstream = probe.streams().best(ffmpeg_next::media::Type::Video)
-            .ok_or_else(|| PyValueError::new_err("Tidak ada aliran video"))?;
-        let vtb = vstream.time_base();
-        let vtb = if vtb.denominator() > 0 { vtb.numerator() as f64 / vtb.denominator() as f64 } else { 0.0 };
-        let duration = vstream.duration() as f64 * vtb;
-        let fps = {
-            let f = vstream.avg_frame_rate();
-            if f.denominator() > 0 { f.numerator() as f64 / f.denominator() as f64 } else { 30.0 }
-        };
-        let vctx = ffmpeg_next::codec::context::Context::from_parameters(vstream.parameters())
-            .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder video: {}", e)))?;
-        let vdec_probe = vctx.decoder().video()
-            .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder video: {}", e)))?;
-        let (width, height) = (vdec_probe.width(), vdec_probe.height());
-        drop(vdec_probe);
+        // [BARU] Video sekarang OPSIONAL. video_decode_loop() (BAGIAN 3)
+        // sendiri udah aman dipanggil buat file tanpa video sama sekali --
+        // dia `return` langsung begitu gak nemu stream video (lihat awal
+        // fungsinya), jadi thread video-nya idle/exit cepat tanpa ganggu
+        // apapun. Yang HARUS diubah di sini cuma bagian probe metadata
+        // (duration/width/height/fps), yang sebelumnya wajib ambil dari
+        // stream video dan bakal gagal keras (`ok_or_else` -> Err) kalau
+        // stream itu gak ada.
+        let vstream_opt = probe.streams().best(ffmpeg_next::media::Type::Video);
+        let has_video = vstream_opt.is_some();
+        let mut duration = 0.0f64;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut fps = 0.0f64;
+
+        if let Some(vstream) = vstream_opt {
+            let vtb = vstream.time_base();
+            let vtb = if vtb.denominator() > 0 { vtb.numerator() as f64 / vtb.denominator() as f64 } else { 0.0 };
+            duration = vstream.duration() as f64 * vtb;
+            fps = {
+                let f = vstream.avg_frame_rate();
+                if f.denominator() > 0 { f.numerator() as f64 / f.denominator() as f64 } else { 30.0 }
+            };
+            let vctx = ffmpeg_next::codec::context::Context::from_parameters(vstream.parameters())
+                .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder video: {}", e)))?;
+            let vdec_probe = vctx.decoder().video()
+                .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder video: {}", e)))?;
+            width = vdec_probe.width();
+            height = vdec_probe.height();
+            drop(vdec_probe);
+        }
 
         let has_audio = probe.streams().best(ffmpeg_next::media::Type::Audio).is_some();
+
+        // [BARU] File audio murni (gak ada stream video sama sekali): durasi
+        // gak bisa diambil dari stream video (gak ada), jadi diambil dari
+        // stream audio -- pola sama kayak AudioInfo::new() (BAGIAN 1):
+        // durasi per-stream dulu, fallback ke durasi container kalau
+        // per-stream-nya gak ke-isi.
+        if !has_video {
+            if let Some(astream) = probe.streams().best(ffmpeg_next::media::Type::Audio) {
+                let atb = astream.time_base();
+                let atb = if atb.denominator() > 0 { atb.numerator() as f64 / atb.denominator() as f64 } else { 0.0 };
+                let astream_duration = astream.duration() as f64 * atb;
+                duration = if astream_duration > 0.0 {
+                    astream_duration
+                } else {
+                    (probe.duration() as f64 / 1_000_000.0).max(0.0)
+                };
+            }
+        }
+
+        // File gak punya video MAUPUN audio -- gak ada apa-apa buat diputer.
+        if !has_video && !has_audio {
+            return Err(PyValueError::new_err("Tidak ada aliran video atau audio yang bisa diputar"));
+        }
+
         drop(probe);
 
         let shared = Arc::new(Shared {
@@ -704,6 +773,7 @@ impl PlayerEngine {
             height,
             fps,
             has_audio: final_has_audio,
+            has_video,
         })
     }
 
@@ -970,7 +1040,14 @@ impl PlayerEngine {
         while Instant::now() < deadline {
             let audio_ready = !self.has_audio
                 || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
-            let video_ready = {
+            // [FIX] File audio murni (has_video = false) gak akan PERNAH
+            // ngisi video_q (video_decode_loop keluar cepat begitu gak
+            // nemu stream video) -- tanpa `!self.has_video ||` di sini,
+            // video_ready gak akan pernah true buat file kayak gitu, dan
+            // wait_for_seek_ready() bakal SELALU kena timeout 400ms penuh
+            // tiap kali play()/seek() dipanggil, walau audionya udah siap
+            // dari awal.
+            let video_ready = !self.has_video || {
                 let q = self.shared.video_q.lock().unwrap();
                 q.back().map(|f| f.pts + 0.05 >= target).unwrap_or(false)
             };
@@ -1736,6 +1813,84 @@ fn decode_audio(py: Python<'_>, file_path: &str, out_rate: u32) -> PyResult<Py<P
     let samples = decode_audio_mono(file_path, out_rate)?;
     let arr = Array1::from_vec(samples);
     Ok(arr.into_pyarray(py).into())
+}
+
+/// [BARU] Versi array publik dari compute_envelope() (dipakai internal oleh
+/// analyze_waveform()) -- bedanya, fungsi ini kerja di atas array sample
+/// yang SUDAH ADA di tangan Python (mis. hasil decode_audio() sekali di
+/// awal), BUKAN decode dari file path lagi. Gantiin
+/// `media_tools.compute_waveform_envelope()` (crate lama) yang dipakai
+/// WaveformWidget di audio_cutter.py -- widget itu nge-decode file SEKALI
+/// lalu simpen array-nya di memori buat digambar ulang tiap kali user
+/// zoom/scroll (gak decode ulang dari file tiap kali).
+///
+/// Beda penting dengan analyze_waveform() (yang balikin RMS ternormalisasi
+/// 0..1 buat 1x render awal): fungsi ini balikin min/max MENTAH per kolom
+/// (bukan ternormalisasi) supaya rendering waveform yang di-zoom tetap
+/// nangkep transient tajam, bukan cuma "amplop" RMS yang halus.
+///
+/// Balikin (mins, maxs, rmss, firsts) -- KEEMPATNYA array paralel sepanjang
+/// `target_points`. `firsts[i]` = sample PERTAMA di chunk ke-i (dipakai
+/// caller Python sebagai representasi "downsampled waveform" buat digambar
+/// sebagai garis/area, terpisah dari mins/maxs/rmss yang dipakai buat
+/// styling lain) -- BUKAN sample pertama dari keseluruhan array (itu beda
+/// makna, jangan disamakan pas nge-debug pemakaiannya).
+#[pyfunction]
+fn compute_waveform_envelope(
+    py: Python<'_>,
+    samples: numpy::PyReadonlyArray1<f32>,
+    target_points: usize,
+) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<f32>>, Py<PyArray1<f32>>, Py<PyArray1<f32>>)> {
+    let samples = samples.as_slice()
+        .map_err(|_| PyValueError::new_err("Array sample harus contiguous (C-order)"))?;
+    let target_points = target_points.max(1);
+
+    if samples.is_empty() {
+        let zeros = || Array1::from_vec(vec![0.0f32; target_points]).into_pyarray(py).into();
+        return Ok((zeros(), zeros(), zeros(), zeros()));
+    }
+
+    let chunk_size = (samples.len() / target_points).max(1);
+    let chunks: Vec<(f32, f32, f32, f32)> = (0..target_points).into_par_iter().map(|i| {
+        let start = i * chunk_size;
+        if start >= samples.len() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let end = (start + chunk_size).min(samples.len());
+        let seg = &samples[start..end];
+        let mn = seg.iter().cloned().fold(f32::INFINITY, f32::min);
+        let mx = seg.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum_sq: f32 = seg.iter().map(|s| s * s).sum();
+        let rms = (sum_sq / seg.len() as f32).sqrt();
+        (mn, mx, rms, seg[0])
+    }).collect();
+
+    let mins: Vec<f32> = chunks.iter().map(|c| c.0).collect();
+    let maxs: Vec<f32> = chunks.iter().map(|c| c.1).collect();
+    let rmss: Vec<f32> = chunks.iter().map(|c| c.2).collect();
+    let firsts: Vec<f32> = chunks.iter().map(|c| c.3).collect();
+
+    Ok((
+        Array1::from_vec(mins).into_pyarray(py).into(),
+        Array1::from_vec(maxs).into_pyarray(py).into(),
+        Array1::from_vec(rmss).into_pyarray(py).into(),
+        Array1::from_vec(firsts).into_pyarray(py).into(),
+    ))
+}
+
+/// [BARU] Expose detect_bpm() (helper internal di atas, dipakai
+/// analyze_waveform()) langsung ke Python buat kasus yang sample-nya udah
+/// ada di tangan (mis. hasil decode_audio() sebelumnya) dan gak mau decode
+/// file yang sama 2x cuma buat estimasi BPM. Gantiin
+/// `media_tools.detect_bpm()` (crate lama). Kalau belum ada sample sama
+/// sekali, lebih murah langsung pakai analyze_waveform() (decode + envelope
+/// + BPM sekaligus dalam 1x baca file).
+#[pyfunction]
+#[pyo3(name = "detect_bpm")]
+fn detect_bpm_py(samples: numpy::PyReadonlyArray1<f32>, sample_rate: u32) -> PyResult<f32> {
+    let samples = samples.as_slice()
+        .map_err(|_| PyValueError::new_err("Array sample harus contiguous (C-order)"))?;
+    Ok(detect_bpm(samples, sample_rate))
 }
 
 /// [BARU] Analisa spektrum FFT untuk chunk sample sembarang -- dipakai
@@ -2724,5 +2879,7 @@ fn media_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_thumbnails, m)?)?;
     m.add_function(wrap_pyfunction!(analyze_loudness, m)?)?;
     m.add_function(wrap_pyfunction!(decode_audio, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_waveform_envelope, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_bpm_py, m)?)?;
     Ok(())
 }
