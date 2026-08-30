@@ -469,6 +469,14 @@ struct Shared {
     playing: AtomicBool,
     stop: AtomicBool,
     eof: AtomicBool,
+    // [BARU] True cuma setelah audio_decode_loop bener2 full-drain (physical
+    // EOF file audio + drain decode-delay buffer). Dipakai bareng `eof`
+    // (yang cuma dikontrol video_decode_loop) di is_eof() -- tanpa ini,
+    // sisi caller (Python) bisa manggil close()/pindah track begitu VIDEO
+    // abis, padahal audio thread masih proses nyelesain sisa decode (mis.
+    // lagi bridging gap PTS gede) -> sisa audio ASLI abis titik itu ikut
+    // ke-drop paksa pas thread di-stop dari luar.
+    audio_eof: AtomicBool,
 
     // Auto-restart dari awal kalau nyampe EOF.
     loop_enabled: AtomicBool,
@@ -648,6 +656,7 @@ impl PlayerEngine {
             playing: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             eof: AtomicBool::new(false),
+            audio_eof: AtomicBool::new(false), // [BARU]
             loop_enabled: AtomicBool::new(false),
             step_request: AtomicBool::new(false),
             clock_base_pts: Mutex::new(0.0),
@@ -882,6 +891,7 @@ impl PlayerEngine {
         }
 
         self.shared.eof.store(false, Ordering::SeqCst);
+        self.shared.audio_eof.store(false, Ordering::SeqCst); // [BARU]
         *self.shared.seek_target.lock().unwrap() = second;
         self.shared.seek_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -919,8 +929,24 @@ impl PlayerEngine {
     }
 
     fn is_eof(&self) -> bool {
-        self.shared.eof.load(Ordering::Relaxed)
-            && self.shared.video_q.lock().unwrap().is_empty()
+        let video_done = self.shared.eof.load(Ordering::Relaxed)
+            && self.shared.video_q.lock().unwrap().is_empty();
+        if !video_done {
+            return false;
+        }
+        // [FIX] Dulu cuma nunggu video -- caller (Python) bisa nganggep
+        // playback "selesai" begitu video abis, padahal audio thread
+        // masih proses drain/bridging gap. Kalau caller lalu manggil
+        // close() (stop.store(true)), sisa audio ASLI setelah titik itu
+        // ikut ke-drop paksa. Sekarang tunggu audio_eof (decode fisik
+        // tuntas) DAN ring buffer playback bener2 kosong (bukan cuma
+        // "hint" sesaat sebelum drain terakhir).
+        if self.has_audio {
+            self.shared.audio_eof.load(Ordering::Relaxed)
+                && self.shared.audio_buffered_hint.load(Ordering::Relaxed) == 0
+        } else {
+            true
+        }
     }
 
     /// Panggil ini tiap tick UI (misal tiap ~8-16ms). Balikin None kalau
@@ -1314,7 +1340,17 @@ fn push_resampled_audio_frame(
         // Dicap ke MAX_GAP_PAD_SEC detik: gap wajar (start delay dsb)
         // tetep di-pad buat sync, gap ekstrem cuma di-log & di-resync
         // tanpa nelen waktu real audio berikutnya.
-        const MAX_GAP_PAD_SEC: f64 = 2.0;
+        // [FIX] Sebelumnya 2.0 detik -- itu titik pembuangan konten ASLI
+        // (bukan cuma silence): expected_audio_pts tetep di-snap penuh ke
+        // frame_pts real di bawah, padahal cuma sebagian gap yg didorong
+        // ke ring buffer -> sisanya ilang permanen dari waktu putar
+        // (persis penyebab audio berhenti jauh sebelum durasi aslinya).
+        // Cap kecil itu dulu perlu karena is_eof() cuma nunggu video --
+        // sekarang udah nunggu audio_eof juga (lihat is_eof()), jadi gak
+        // ada lagi risiko caller manggil close() di tengah proses bridging
+        // gap besar. Angka di bawah ini murni pengaman anti-hang buat gap
+        // yang gak masuk akal (file korup total), bukan titik pembuangan.
+        const MAX_GAP_PAD_SEC: f64 = 30.0;
         if raw_gap_sec > MAX_GAP_PAD_SEC {
             eprintln!(
                 "[media_engine] PTS jump gede ({:.2}s) kedetect @ ~{:.2}s -- dianggap glitch timestamp (bukan silence asli), pad dibatasin ke {:.1}s biar sisa audio asli abis titik ini tetep sempet ke-decode",
@@ -1344,10 +1380,18 @@ fn push_resampled_audio_frame(
 
     // 2. SETUP RESAMPLER
     if resampler.is_none() {
+        // [FIX] MP3 (apalagi dengan ID3v2 tag gede / Xing-VBR header di
+        // frame pertama) kadang bikin decoder.channels() masih 0 sesaat
+        // sebelum frame audio pertama beneran ke-parse. ChannelLayout
+        // kosong (0 channel) diteruskan ke Context::get() beresiko kena
+        // assert/unwrap internal di binding ffmpeg (panic BUKAN dari kode
+        // kita, tapi dari crate) -- fallback ke stereo daripada terusin
+        // dengan channel count 0.
+        let safe_channels = if decoder_channels > 0 { decoder_channels } else { 2 };
         let src_layout = if aframe.channel_layout().bits() != 0 {
             aframe.channel_layout()
         } else {
-            ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder_channels)
+            ffmpeg_next::util::channel_layout::ChannelLayout::default(safe_channels)
         };
         *resampler = match ffmpeg_next::software::resampling::Context::get(
             aframe.format(), src_layout, aframe.rate(),
@@ -1495,6 +1539,7 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                 // nulis base+flush yang sama, gak ada efek dobel.
                 shared.reset_clock(sec);
                 sent_eof = false;
+                shared.audio_eof.store(false, Ordering::Relaxed); // [BARU]
             }
             packet_iter = Some(input_ctx.packets());
             applied_seek_seq = current_seq;
@@ -1543,6 +1588,11 @@ fn audio_decode_loop(file_path: String, shared: Arc<Shared>, mut producer: Audio
                         "[media_engine] audio thread nyampe EOF file fisik (udah di-drain) @ posisi ~{:.2}s (kalau ini muncul jauh sebelum durasi video abis, kemungkinan track audio di file emang lebih pendek drpd video, bukan bug decode)",
                         shared.position(),
                     );
+                    // [BARU] Baru sekarang audio beneran "selesai" secara
+                    // decode. is_eof() nunggu ini + ring buffer kosong
+                    // sebelum caller (Python) dianggap boleh nutup/pindah
+                    // track -- lihat comment di field audio_eof.
+                    shared.audio_eof.store(true, Ordering::Relaxed);
                 }
                 // EOF di sisi audio gak nge-trigger apa2 (bukan yg megang
                 // status "selesai" buat UI, itu video_decode_loop). Kalau
@@ -1654,10 +1704,15 @@ fn decode_audio_mono(file_path: &str, out_rate: u32) -> PyResult<Vec<f32>> {
     macro_rules! resample_and_push {
         ($frame:expr) => {{
             if resampler.is_none() {
+                // [FIX] Sama kayak di push_resampled_audio_frame -- jaga2
+                // kalau decoder.channels() masih 0 di frame pertama (MP3
+                // dengan ID3v2/Xing header gede).
+                let ch = decoder.channels() as i32;
+                let safe_channels = if ch > 0 { ch } else { 2 };
                 let src_layout = if $frame.channel_layout().bits() != 0 {
                     $frame.channel_layout()
                 } else {
-                    ffmpeg_next::util::channel_layout::ChannelLayout::default(decoder.channels() as i32)
+                    ffmpeg_next::util::channel_layout::ChannelLayout::default(safe_channels)
                 };
                 resampler = ffmpeg_next::software::resampling::Context::get(
                     $frame.format(), src_layout, $frame.rate(),
