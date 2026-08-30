@@ -326,8 +326,14 @@ class PlayerTestWindow(QMainWindow):
 
         last_dir = self.settings.value("last_dir", "")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Pilih file video", last_dir,
-            "Video (*.mp4 *.mkv *.webm *.mov *.avi);;Semua file (*.*)",
+            self, "Pilih file media", last_dir,
+            # [BARU] PlayerEngine udah dukung file audio murni (has_video
+            # = false di sisi Rust) -- filter dialog cuma perlu dibukain,
+            # gak ada perubahan lain yang dibutuhin buat bisa buka mp3/dll.
+            "Semua media (*.mp4 *.mkv *.webm *.mov *.avi *.mp3 *.flac *.wav *.ogg *.m4a *.aac);;"
+            "Video (*.mp4 *.mkv *.webm *.mov *.avi);;"
+            "Audio (*.mp3 *.flac *.wav *.ogg *.m4a *.aac);;"
+            "Semua file (*.*)",
         )
         if not path:
             return
@@ -352,15 +358,38 @@ class PlayerTestWindow(QMainWindow):
 
         self._duration = self.engine.duration
         audio_note = "ada audio" if self.engine.has_audio else "TANPA audio"
-        self.status_label.setText(
-            f"{os.path.basename(path)} — {self.engine.width}x{self.engine.height} "
-            f"@{self.engine.fps:.2f}fps, {audio_note}"
-        )
-        self.video_label.setText("")
+
+        # [BARU] File audio murni (has_video=False): width/height/fps di
+        # sisi Rust sengaja dikosongin (0), jadi jangan ditampilin di
+        # status label -- bikin bingung ("0x0 @0.00fps"). Tampilan beda
+        # buat kasus ini, fokus ke info audio-nya aja.
+        if self.engine.has_video:
+            self.status_label.setText(
+                f"{os.path.basename(path)} — {self.engine.width}x{self.engine.height} "
+                f"@{self.engine.fps:.2f}fps, {audio_note}"
+            )
+        else:
+            self.status_label.setText(f"{os.path.basename(path)} — audio only")
+
+        # [BARU] Gak ada frame video buat ditampilin di audio-only mode --
+        # video_label dipake nunjukin placeholder ikon musik + nama file,
+        # bukan dibiarin nampilin frame terakhir dari file sebelumnya (atau
+        # kosong item, keliatan kayak nge-hang).
+        if self.engine.has_video:
+            self.video_label.setText("")
+            self.video_label.setPixmap(QPixmap())
+        else:
+            self.video_label.setPixmap(QPixmap())
+            self.video_label.setText(f"🎵  {os.path.basename(path)}\n(audio only, gak ada video)")
+
         self.play_btn.setEnabled(True)
         self.play_btn.setText("▶ Play")
         self.stop_btn.setEnabled(True)
-        self.next_frame_btn.setEnabled(True)
+        # [FIX] Frame-step gak masuk akal buat file tanpa video -- kalau
+        # dibiarin aktif, step_frame() cuma diem-diem gak ngapa2in (gak
+        # ada video_decode_loop yang beneran jalan buat file ini), keliatan
+        # kayak tombolnya rusak drpd "emang gak berlaku di sini".
+        self.next_frame_btn.setEnabled(self.engine.has_video)
         self.loop_checkbox.setEnabled(True)
         self.engine.set_loop(self.loop_checkbox.isChecked())
 
@@ -373,7 +402,15 @@ class PlayerTestWindow(QMainWindow):
 
         self.engine.play()
         self.tick_timer.start()
-        self._start_thumbnail_worker(path)
+        # [FIX] VideoDecoder (dipakai ThumbnailWorker) butuh stream video --
+        # buat file audio-only bakal selalu gagal bikin instance-nya tiap
+        # kali cursor hover di seekbar (exception ke-log berulang percuma).
+        # Sekalian gak ada gunanya nampilin thumbnail buat file yang emang
+        # gak ada framenya.
+        if self.engine.has_video:
+            self._start_thumbnail_worker(path)
+        else:
+            self._stop_thumbnail_worker()
 
     # ────────────────────────────────────────────
     # Transport controls
@@ -468,6 +505,10 @@ class PlayerTestWindow(QMainWindow):
 
     def _on_seekbar_hover(self, frac: float, global_pos: QPoint):
         if self._duration <= 0 or VideoDecoder is None:
+            return
+        # [BARU] Audio-only: thumbnail worker sengaja gak dijalanin (lihat
+        # _load_file), jadi hover di sini gak ada yang perlu diproses.
+        if self.engine is not None and not self.engine.has_video:
             return
         self._is_hovering_seekbar = True
         self._pending_hover_time = frac * self._duration
