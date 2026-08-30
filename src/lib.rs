@@ -929,8 +929,17 @@ impl PlayerEngine {
     }
 
     fn is_eof(&self) -> bool {
-        let video_done = self.shared.eof.load(Ordering::Relaxed)
-            && self.shared.video_q.lock().unwrap().is_empty();
+        // [FIX] File audio murni (has_video = false): video_decode_loop
+        // return LANGSUNG di awal begitu gak nemu stream video (baris
+        // ~1124), gak pernah nyentuh shared.eof sama sekali -- tanpa
+        // `!self.has_video ||` di sini, is_eof() bakal selalu false
+        // selamanya buat audio-only, playback gak akan pernah kedetect
+        // "selesai". Pola sama persis kayak video_ready di
+        // wait_for_seek_ready().
+        let video_done = !self.has_video || (
+            self.shared.eof.load(Ordering::Relaxed)
+                && self.shared.video_q.lock().unwrap().is_empty()
+        );
         if !video_done {
             return false;
         }
