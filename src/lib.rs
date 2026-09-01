@@ -696,7 +696,7 @@ impl PlayerEngine {
 
                     let build_result = match cfg.sample_format() {
                         cpal::SampleFormat::F32 => device.build_output_stream(
-                            &stream_cfg,
+                            stream_cfg,
                             move |data: &mut [f32], _| {
                                 if shared_cb.audio_flush.swap(false, Ordering::Relaxed) {
                                     // Timeline abis loncat (seek/step/loop-restart) --
