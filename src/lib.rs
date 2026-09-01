@@ -676,7 +676,10 @@ impl PlayerEngine {
             let host = cpal::default_host();
             if let Some(device) = host.default_output_device() {
                 if let Ok(cfg) = device.default_output_config() {
-                    let sample_rate = cfg.sample_rate().0 as i64;
+                    // [UPDATE cpal 0.15 -> 0.18] `SampleRate` sejak 0.17 udah
+                    // bukan tuple struct lagi, tapi type alias `u32` langsung
+                    // -- jadi `.0` di sini dihapus (dulu `cfg.sample_rate().0`).
+                    let sample_rate = cfg.sample_rate() as i64;
                     let channels = cfg.channels() as i64;
                     shared.out_sample_rate.store(sample_rate, Ordering::Relaxed);
                     shared.out_channels.store(channels, Ordering::Relaxed);
@@ -691,9 +694,17 @@ impl PlayerEngine {
                     let stream_cfg: cpal::StreamConfig = cfg.clone().into();
                     let shared_cb = Arc::clone(&shared);
 
-                    let build_result = match cfg.sample_format() {
-                        cpal::SampleFormat::F32 => device.build_output_stream(
-                            &stream_cfg,
+                    // [UPDATE cpal 0.18] Sejak 0.18 semua enum error per-operasi
+                    // (BuildStreamError, StreamError, dkk) udah dilebur jadi satu
+                    // `cpal::Error` (gak ada varian publik yang bisa dikonstruksi
+                    // manual kayak `StreamConfigNotSupported` dulu). Karena di sini
+                    // kita cuma butuh tau "berhasil bikin stream atau enggak" (gak
+                    // butuh cabang per jenis error), pembungkusnya diganti jadi
+                    // `Option` -- cabang selain F32 gak manggil build_output_stream
+                    // sama sekali (jadi gak perlu bikin nilai error tiruan).
+                    let build_result: Option<Result<cpal::Stream, cpal::Error>> = match cfg.sample_format() {
+                        cpal::SampleFormat::F32 => Some(device.build_output_stream(
+                            stream_cfg,
                             move |data: &mut [f32], _| {
                                 if shared_cb.audio_flush.swap(false, Ordering::Relaxed) {
                                     // Timeline abis loncat (seek/step/loop-restart) --
@@ -719,13 +730,13 @@ impl PlayerEngine {
                             },
                             |err| eprintln!("[media_engine] audio stream error: {err}"),
                             None,
-                        ),
+                        )),
                         // Device jarang minta selain f32 di WASAPI shared mode,
                         // tapi kalau ketemu kasusnya, tambahin cabang i16/u16 di sini.
-                        _ => Err(cpal::BuildStreamError::StreamConfigNotSupported),
+                        _ => None,
                     };
 
-                    if let Ok(stream) = build_result {
+                    if let Some(Ok(stream)) = build_result {
                         // JANGAN langsung .play() di sini. Kalau langsung jalan,
                         // callback di atas bakal langsung mulai narik ring buffer
                         // yang masih kosong (decode thread belom sempet ngisi
