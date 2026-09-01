@@ -304,6 +304,19 @@ jobs:
               "-C", "link-arg=-lsecur32",
               "-C", "link-arg=-lole32",
               "-C", "link-arg=-lcrypt32",
+              # [UPDATE FFmpeg 9.0] `libavformat/tls_schannel.c` -- backend TLS
+              # native Windows (SChannel + CNG) yang BARU di FFmpeg 9.0, auto-
+              # kompilasi begitu target-os=mingw32 (gak butuh --enable flag
+              # apapun, beda dari openssl/gnutls yang opt-in). Dia manggil
+              # fungsi CNG (NCryptOpenStorageProvider, NCryptCreatePersistedKey,
+              # dst) yang tinggal di ncrypt.dll -- import lib-nya (`libncrypt.a`)
+              # udah ada bawaan mingw-w64, tapi gak otomatis ke-link, jadi
+              # ditambahin manual di sini. Ini juga artinya https:// di
+              # PlayerEngine kemungkinan udah/bakal jalan lewat SChannel
+              # bawaan Windows begitu ini kelar, bukan lewat openssl/gnutls
+              # (jadi catatan soal "belum ada backend TLS" di komentar
+              # Cargo.toml sebelumnya perlu direvisi -- akan dicek ulang).
+              "-C", "link-arg=-lncrypt",
               # [FIX] Bungkus lib statis kita + runtime mingw pakai
               # --start-group/--end-group. `ld` itu single-pass (scan kiri
               # ke kanan sekali doang) -- tanpa group ini, `-lmp3lame` di
