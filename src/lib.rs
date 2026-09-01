@@ -676,7 +676,10 @@ impl PlayerEngine {
             let host = cpal::default_host();
             if let Some(device) = host.default_output_device() {
                 if let Ok(cfg) = device.default_output_config() {
-                    let sample_rate = cfg.sample_rate().0 as i64;
+                    // [UPDATE cpal 0.15 -> 0.18] `SampleRate` sejak 0.17 udah
+                    // bukan tuple struct lagi, tapi type alias `u32` langsung
+                    // -- jadi `.0` di sini dihapus (dulu `cfg.sample_rate().0`).
+                    let sample_rate = cfg.sample_rate() as i64;
                     let channels = cfg.channels() as i64;
                     shared.out_sample_rate.store(sample_rate, Ordering::Relaxed);
                     shared.out_channels.store(channels, Ordering::Relaxed);
