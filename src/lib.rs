@@ -1442,7 +1442,7 @@ fn push_resampled_audio_frame(
     // cuma metadata channel_layout kosong yang udah dipatch di bagian 2),
     // rebuild resampler pakai parameter frame SEKARANG lalu retry sekali
     // sebelum bener-bener nyerah & drop frame ini.
-    let do_resample_and_push = |rs: &mut ffmpeg_next::software::resampling::Context,
+    let mut do_resample_and_push = |rs: &mut ffmpeg_next::software::resampling::Context,
                                  aframe: &ffmpeg_next::frame::Audio|
      -> Result<(), ffmpeg_next::Error> {
         let mut resampled = ffmpeg_next::frame::Audio::empty();
