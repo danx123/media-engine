@@ -10,17 +10,18 @@ jobs:
     name: Cross-compile Windows wheel (abi3)
     runs-on: ubuntu-latest
     env:
-      # [FIX] Samakan minor version FFmpeg dengan `ffmpeg-next = "7.0"` di
-      # Cargo.toml. ffmpeg-next punya banyak `match` Rust manual (pixel
-      # format, codec ID, dll) yang di-generate/di-maintain untuk rentang
-      # versi tertentu -- kalau FFmpeg yang dikompilasi lebih baru (mis.
-      # n7.1) dan menambah varian enum baru, bindgen ikut memasukkannya ke
+      # [UPDATE] Samakan minor version FFmpeg dengan `ffmpeg-next = "9.0"` di
+      # Cargo.toml (sudah dinaikin bareng, lihat komentar [UPDATE] di sana).
+      # ffmpeg-next punya banyak `match` Rust manual (pixel format, codec ID,
+      # dll) yang di-generate/di-maintain untuk rentang versi tertentu --
+      # kalau FFmpeg yang dikompilasi lebih baru dari yang crate-nya dukung
+      # dan menambah varian enum baru, bindgen ikut memasukkannya ke
       # bindings.rs, tapi match statement di ffmpeg-next belum kenal varian
       # itu -> compile error E0004 "non-exhaustive patterns". Kalau nanti
-      # mau naik ke FFmpeg 7.1, naikkan juga `ffmpeg-next` (dan
-      # `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support 7.1
-      # secara eksplisit, jangan cuma ganti tag ini sendirian.
-      FFMPEG_TAG: n7.1
+      # mau naik lagi ke versi FFmpeg berikutnya, naikkan juga `ffmpeg-next`
+      # (dan `ffmpeg-sys-next` transitif-nya) ke versi yang sudah support
+      # versi itu secara eksplisit dulu, jangan cuma ganti tag ini sendirian.
+      FFMPEG_TAG: n9.0
 
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +80,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v19-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          # [UPDATE] v18 -> v19: naikin suffix cache-key biar cache lama
+          # (hasil build FFmpeg n7.1) gak ke-reuse keliru buat FFMPEG_TAG
+          # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
+          # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
+          # signifikan (biar gampang dibedain di tab cache Actions).
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v20-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
