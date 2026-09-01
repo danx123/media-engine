@@ -85,7 +85,7 @@ jobs:
           # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
           # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
           # signifikan (biar gampang dibedain di tab cache Actions).
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v21-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v22-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -222,6 +222,20 @@ jobs:
           # (mau enable atau disable) udah bikin error. Gak ada dampak fungsional
           # ke media_engine karena postproc emang gak pernah dipakai (cuma
           # filter `pp` di libavfilter yang sekarang udah hilang bareng lib-nya).
+          #
+          # [UPDATE FFmpeg 9.0] `d3d12va` adalah hwaccel BARU (Direct3D 12
+          # video acceleration) yang baru ditambahin di FFmpeg 9.0, gak ada
+          # di 7.1. Meskipun ini autodetect (gak dulu eksplisit di-enable),
+          # header publik `libavutil/hwcontext_d3d12va.h` tetep ke-install
+          # dan ke-parse sama bindgen-nya ffmpeg-sys-next -- header itu
+          # nge-include `d3d12video.h` (bagian dari DirectX 12 Video API)
+          # yang gak ada di paket mingw-w64 Ubuntu yang kepasang di step
+          # "Pasang toolchain cross mingw-w64" (headernya kekinian banget),
+          # jadi bindgen gagal dengan "fatal error: 'd3d12video.h' file not
+          # found". Sama kayak d3d11va/dxva2/mediafoundation, kita gak butuh
+          # hardware decode di target build ini, jadi paling simpel
+          # ditambahin `--disable-d3d12va` (lihat di bawah) biar headernya
+          # gak ke-install sama sekali.
           ./configure \
             --prefix="$HOME/ffmpeg-windows" \
             --enable-cross-compile \
@@ -242,6 +256,7 @@ jobs:
             --disable-w32threads \
             --disable-dxva2 \
             --disable-d3d11va \
+            --disable-d3d12va \
             --disable-mediafoundation \
             --enable-libdav1d \
             --enable-libmp3lame \
