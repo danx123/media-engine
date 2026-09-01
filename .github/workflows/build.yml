@@ -85,7 +85,7 @@ jobs:
           # n9.0 yang baru -- walau FFMPEG_TAG sudah ikut di key, nomor versi
           # ini dinaikin manual tiap kali konfigurasi/versi FFmpeg-nya lompat
           # signifikan (biar gampang dibedain di tab cache Actions).
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v22-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v23-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -267,6 +267,9 @@ jobs:
             
           make -j"$(nproc)"
           make install
+          
+          # Remove problematic hardware context headers to prevent bindgen errors
+          rm -f "$HOME/ffmpeg-windows/include/libavutil/hwcontext_d3d12va.h"
 
       # [BARU] Selalu set FFMPEG_DIR di sini (bukan di dalam step compile),
       # supaya tetap ke-set dengan benar walau step compile di atas di-skip
