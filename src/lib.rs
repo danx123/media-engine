@@ -69,6 +69,31 @@ fn rational_to_f64(r: ffmpeg_next::Rational) -> f64 {
     }
 }
 
+/// Buka dekoder video dengan multi-threading aktif (FF_THREAD_FRAME | FF_THREAD_SLICE).
+/// Krusial buat codec berat seperti VP9/AV1/HEVC: default ffmpeg-next memakai
+/// thread_count = 1 (single-thread), yang bikin decode VP9 1080p/4K keteteran
+/// (tersendat) dan catch-up setelah seek ke keyframe jauh memakan waktu ratusan ms.
+fn open_multithreaded_video_decoder(
+    params: ffmpeg_next::codec::Parameters,
+) -> Result<ffmpeg_next::decoder::Video, ffmpeg_next::Error> {
+    let mut ctx = ffmpeg_next::codec::context::Context::from_parameters(params)?;
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let threads = cores.clamp(2, 16);
+    ctx.set_threading(ffmpeg_next::codec::threading::Config {
+        kind: ffmpeg_next::codec::threading::Type::Frame,
+        count: threads,
+    });
+    unsafe {
+        (*ctx.as_mut_ptr()).thread_type =
+            ffmpeg_next::ffi::FF_THREAD_FRAME | ffmpeg_next::ffi::FF_THREAD_SLICE;
+        (*ctx.as_mut_ptr()).thread_count = threads as i32;
+        (*ctx.as_mut_ptr()).flags2 |= ffmpeg_next::ffi::AV_CODEC_FLAG2_FAST;
+    }
+    ctx.decoder().video()
+}
+
 // ═══════════════════════════════════════════════
 // BAGIAN 1: INFORMASI MEDIA (gak diubah)
 // ═══════════════════════════════════════════════
@@ -271,9 +296,7 @@ impl VideoDecoder {
         let duration = stream.duration() as f64 * time_base;
         let codec = stream.parameters().id().name().to_string();
 
-        let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
-        let decoder = ctx.decoder().video()
+        let decoder = open_multithreaded_video_decoder(stream.parameters())
             .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder: {}", e)))?;
 
         let (width, height) = (decoder.width(), decoder.height());
@@ -305,12 +328,12 @@ impl VideoDecoder {
 
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut packet_count = 0;
-        let max_try = 200;
+        let max_try = 1500;
         let mut got_frame = false;
 
         'read_loop: for (stream, packet) in self.input_ctx.packets() {
             if packet_count > max_try {
-                return Err(PyRuntimeError::new_err("Bingkai tidak ditemukan"));
+                break;
             }
             if stream.index() != self.stream_idx {
                 packet_count += 1;
@@ -320,11 +343,23 @@ impl VideoDecoder {
                 .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket gagal: {}", e)))?;
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 got_frame = true;
-                if decoded.timestamp().unwrap_or(0) >= target_ts {
+                let ts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0);
+                if ts >= target_ts {
                     break 'read_loop;
                 }
             }
             packet_count += 1;
+        }
+
+        if !got_frame {
+            let _ = self.decoder.send_eof();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                got_frame = true;
+                let ts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0);
+                if ts >= target_ts {
+                    break;
+                }
+            }
         }
 
         if !got_frame {
@@ -338,13 +373,23 @@ impl VideoDecoder {
         let mut decoded = ffmpeg_next::frame::Video::empty();
         let mut got_frame = false;
 
-        for (stream, packet) in self.input_ctx.packets() {
-            if stream.index() != self.stream_idx { continue; }
-            self.decoder.send_packet(&packet)
-                .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket: {}", e)))?;
-            if self.decoder.receive_frame(&mut decoded).is_ok() {
-                got_frame = true;
-                break;
+        if self.decoder.receive_frame(&mut decoded).is_ok() {
+            got_frame = true;
+        } else {
+            for (stream, packet) in self.input_ctx.packets() {
+                if stream.index() != self.stream_idx { continue; }
+                self.decoder.send_packet(&packet)
+                    .map_err(|e| PyRuntimeError::new_err(format!("Kirim paket: {}", e)))?;
+                if self.decoder.receive_frame(&mut decoded).is_ok() {
+                    got_frame = true;
+                    break;
+                }
+            }
+            if !got_frame {
+                let _ = self.decoder.send_eof();
+                if self.decoder.receive_frame(&mut decoded).is_ok() {
+                    got_frame = true;
+                }
             }
         }
 
@@ -372,7 +417,7 @@ fn rgb_from_decoded(
             let ctx = ffmpeg_next::software::scaling::Context::get(
                 src_format, width, height,
                 ffmpeg_next::util::format::Pixel::RGB24, width, height,
-                ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
             ).map_err(|e| PyRuntimeError::new_err(format!("Buat konteks scaling: {}", e)))?;
             scaler_slot.insert(ctx)
         }
@@ -386,12 +431,18 @@ fn rgb_from_decoded(
 
     let stride = rgb_frame.stride(0);
     let row_width = (width as usize) * 3;
-    let mut data = Vec::with_capacity((height as usize) * row_width);
+    let total_bytes = (height as usize) * row_width;
     let raw_data = rgb_frame.data(0);
-    for y in 0..(height as usize) {
-        let start = y * stride;
-        data.extend_from_slice(&raw_data[start..start + row_width]);
-    }
+    let data = if stride == row_width && raw_data.len() >= total_bytes {
+        raw_data[..total_bytes].to_vec()
+    } else {
+        let mut buf = Vec::with_capacity(total_bytes);
+        for y in 0..(height as usize) {
+            let start = y * stride;
+            buf.extend_from_slice(&raw_data[start..start + row_width]);
+        }
+        buf
+    };
 
     let arr = Array3::from_shape_vec((height as usize, width as usize, 3), data)
         .map_err(|e| PyRuntimeError::new_err(format!("Array gagal: {}", e)))?;
@@ -556,6 +607,10 @@ struct Shared {
     // Dipakai kalau video tanpa audio, atau sebelum audio callback mulai jalan.
     clock_base_pts: Mutex<f64>,
     clock_base_wall: Mutex<Option<Instant>>,
+    // [BARU] True kalau setelah seek, stream audio cpal belum dinyalakan kembali
+    // karena sedang menunggu decode thread video & audio menyiapkan frame di titik
+    // seek (non-blocking seek agar UI tidak freeze saat scrubbing VP9 GOP panjang).
+    seek_resuming: AtomicBool,
 }
 
 impl Shared {
@@ -567,6 +622,9 @@ impl Shared {
             base + frames / sr
         } else {
             let base = *self.clock_base_pts.lock().unwrap();
+            if self.seek_resuming.load(Ordering::Relaxed) {
+                return base;
+            }
             match *self.clock_base_wall.lock().unwrap() {
                 Some(t) if self.playing.load(Ordering::Relaxed) => {
                     base + t.elapsed().as_secs_f64() * self.rate()
@@ -961,6 +1019,7 @@ impl PlayerEngine {
             step_request: AtomicBool::new(false),
             clock_base_pts: Mutex::new(0.0),
             clock_base_wall: Mutex::new(None),
+            seek_resuming: AtomicBool::new(false),
         });
 
         // ── Setup cpal output stream (kalau ada audio) ──
@@ -1244,17 +1303,15 @@ impl PlayerEngine {
     /// Mulai/lanjutkan playback.
     fn play(&mut self) {
         if !self.shared.playing.swap(true, Ordering::SeqCst) {
-            // Tunggu AUDIO dan VIDEO dua2nya siap sebelum stream cpal
-            // beneran dibuka. Lihat wait_for_seek_ready() -- ini juga yang
-            // nyegah audio "kabur duluan" ninggalin video pas video masih
-            // proses nyiapin frame pertama.
+            // Non-blocking: biarkan get_frame() atau position() menyalakan
+            // stream cpal begitu audio & video siap di posisi target, atau
+            // tunggu singkat (~15ms) kalau sudah hampir siap.
             let target = self.shared.position();
             let seq = self.shared.seek_seq.load(Ordering::SeqCst);
-            self.wait_for_seek_ready(target, seq);
-            if let Some(stream) = self._audio_stream.as_ref() {
-                let _ = stream.play();
+            self.shared.seek_resuming.store(true, Ordering::SeqCst);
+            if self.wait_for_seek_ready_brief(target, seq, Duration::from_millis(16)) {
+                self.finish_seek_resume();
             }
-            *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
         }
     }
 
@@ -1264,6 +1321,7 @@ impl PlayerEngine {
     /// detik) bakal tetep kebunyi & bikin clock (makanya seekbar) keliatan
     /// jalan terus meski status-nya "paused".
     fn pause(&mut self) {
+        self.shared.seek_resuming.store(false, Ordering::SeqCst);
         if let Some(stream) = self._audio_stream.as_ref() {
             let _ = stream.pause();
         }
@@ -1318,15 +1376,11 @@ impl PlayerEngine {
         }
     }
 
-    /// Lompat ke detik tertentu. Kalau lagi playing, audio stream dipause
-    /// sesaat sementara nunggu KEDUANYA (audio dan video) siap lagi di
-    /// posisi baru. Audio biasanya seek hampir instan, tapi video harus
-    /// nyari keyframe terdekat dulu baru "ngejar" maju ke target -- itu
-    /// bisa makan waktu jauh lebih lama drpd audio. Kalau cuma nunggu audio
-    /// doang (seperti sebelumnya), begitu resume, audio langsung jalan dari
-    /// posisi target sementara video masih proses ngejar -- kerasa "audio
-    /// duluan drpd video". Kalau lagi paused, gak ada yang perlu ditunggu
-    /// (stream emang udah diem, dan Python nunggu next tick apa adanya).
+    /// Lompat ke detik tertentu secara non-blocking agar UI sama sekali tidak
+    /// freeze saat scrubbing (khususnya codec VP9/AV1 dengan GOP panjang).
+    /// Jika sedang playing, stream audio di-pause sementara dan otomatis
+    /// dilanjutkan di tick get_frame()/position() berikutnya begitu decode
+    /// thread video & audio siap di posisi target.
     fn seek(&mut self, second: f64) {
         let target = second.max(0.0);
         let was_playing = self.shared.playing.load(Ordering::Relaxed);
@@ -1348,17 +1402,22 @@ impl PlayerEngine {
         let new_seq = self.shared.seek_seq.fetch_add(1, Ordering::SeqCst) + 1;
 
         if was_playing {
-            self.wait_for_seek_ready(target, new_seq);
-            if let Some(stream) = self._audio_stream.as_ref() {
-                let _ = stream.play();
+            self.shared.seek_resuming.store(true, Ordering::SeqCst);
+            // Coba tunggu sangat singkat (maks 8ms); jika keyframe dekat dan
+            // langsung siap, nyalakan audio sekarang. Jika butuh catch-up GOP
+            // panjang (VP9), langsung kembali ke Python tanpa mem-block UI!
+            if self.wait_for_seek_ready_brief(target, new_seq, Duration::from_millis(8)) {
+                self.finish_seek_resume();
             }
-            *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
+        } else {
+            self.shared.seek_resuming.store(false, Ordering::SeqCst);
         }
     }
 
     /// Posisi playback sekarang (detik), dihitung dari clock audio
     /// (atau wall-clock kalau video-only).
-    fn position(&self) -> f64 {
+    fn position(&mut self) -> f64 {
+        self.poll_seek_resume();
         self.shared.position()
     }
 
@@ -1456,21 +1515,38 @@ impl PlayerEngine {
     /// nampilin frame terakhir yang ada, jangan blok nunggu.
     /// Return: Some((array_rgb, pts_detik)) atau None.
     fn get_frame(&mut self, py: Python<'_>) -> PyResult<Option<(Py<PyArray3<u8>>, f64)>> {
+        self.poll_seek_resume();
         let now = self.shared.position();
         let mut q = self.shared.video_q.lock().unwrap();
 
-        // Buang frame yang udah basi (telat) biar gak numpuk delay -> ini
-        // yang bikin video "ngejar" balik ke posisi seharusnya kalau sempet
-        // ketinggalan, dibanding numpuk dan diputer kayak fast-forward.
-        while let Some(front) = q.front() {
-            if front.pts + LATE_FRAME_DROP_SEC < now {
-                q.pop_front();
-                continue;
+        // Saat baru selesai seek atau sedang paused, tampilkan frame pertama yang
+        // sudah tiba di titik seek meskipun PTS-nya sedikit di depan `now` (mis.
+        // karena pembulatan timestamp paket VP9/WebM atau audio frame pertama sedikit
+        // lebih awal dari frame video pertama setelah titik seek).
+        let is_paused = !self.shared.playing.load(Ordering::Relaxed);
+        let is_resuming = self.shared.seek_resuming.load(Ordering::Relaxed);
+
+        if !is_paused && !is_resuming {
+            // Buang frame yang udah basi (telat) biar gak numpuk delay -> ini
+            // yang bikin video "ngejar" balik ke posisi seharusnya kalau sempet
+            // ketinggalan, dibanding numpuk dan diputer kayak fast-forward.
+            // Sisakan minimal 1 frame kalau frame berikutnya belum siap ditampilkan
+            // agar layar tidak freeze kosong saat CPU sempat spike.
+            while q.len() > 1 {
+                if let Some(front) = q.front() {
+                    if front.pts + LATE_FRAME_DROP_SEC < now {
+                        q.pop_front();
+                        continue;
+                    }
+                }
+                break;
             }
-            break;
         }
 
-        let ready = matches!(q.front(), Some(f) if f.pts <= now);
+        let ready = match q.front() {
+            Some(f) => f.pts <= now || is_paused || is_resuming,
+            None => false,
+        };
         if !ready {
             return Ok(None);
         }
@@ -1554,49 +1630,84 @@ impl PlayerEngine {
 /// Helper internal -- sengaja dipisah dari blok #[pymethods] di atas
 /// biar gak ikut ke-expose sebagai method Python.
 impl PlayerEngine {
-    /// Tunggu (dibatasi ~400ms) sampe AUDIO dan VIDEO dua2nya siap di
-    /// sekitar posisi `target`, sebelum stream audio beneran
-    /// dibuka/dibuka-lagi. Dipanggil dari play() dan seek().
-    ///
-    /// - Audio dianggap siap kalau ring buffer-nya udah keisi ~150ms sample.
-    /// - Video dianggap siap kalau frame TERBARU yang udah didecode
-    ///   (q.back(), bukan q.front() -- back() nunjukkin sejauh mana decode
-    ///   udah "nyampe", front() cuma frame paling lama yg masih ngendon)
-    ///   udah nyampe/lewatin target. Video butuh ini krn abis seek dia
-    ///   harus nyari keyframe dulu baru ngejar maju ke target -- proses itu
-    ///   ambil waktu jauh lebih lama drpd audio yang seek-nya nyaris instan.
-    ///
-    /// Tanpa nunggu video juga, audio bakal mulai bunyi duluan begitu
-    /// buffer-nya siap, ninggalin video yang masih proses ngejar -- kerasa
-    /// "audio duluan drpd video" tiap abis play()/seek(). Timeout ada biar
-    /// UI gak nge-hang selamanya kalau video-nya lambat/macet.
-    fn wait_for_seek_ready(&self, target: f64, expected_seq: u64) {
+    /// Cek apakah AUDIO dan VIDEO dua2nya udah siap di posisi `target`
+    /// untuk `expected_seq` tanpa nge-block sama sekali.
+    fn is_seek_ready(&self, target: f64, expected_seq: u64) -> bool {
+        let a_acked = !self.has_audio
+            || self.shared.audio_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+        let v_acked = !self.has_video
+            || self.shared.video_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+        if !a_acked || !v_acked {
+            return false;
+        }
         let sr = self.shared.out_sample_rate.load(Ordering::Relaxed).max(1) as usize;
         let ch = self.shared.out_channels.load(Ordering::Relaxed).max(1) as usize;
-        let audio_target = (sr * ch) / 8; // ~125ms readahead baru pada posisi target
-        let deadline = Instant::now() + Duration::from_millis(450);
+        let audio_target = (sr * ch) / 10; // ~100ms readahead baru pada posisi target
 
-        while Instant::now() < deadline {
-            let a_acked = !self.has_audio
-                || self.shared.audio_acked_seq.load(Ordering::SeqCst) >= expected_seq;
-            let v_acked = !self.has_video
-                || self.shared.video_acked_seq.load(Ordering::SeqCst) >= expected_seq;
+        let audio_ready = !self.has_audio
+            || self.shared.audio_eof.load(Ordering::Relaxed)
+            || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
+        let video_ready = !self.has_video
+            || self.shared.eof.load(Ordering::Relaxed)
+            || {
+                let q = self.shared.video_q.lock().unwrap();
+                q.front().map(|f| f.pts + 0.1 >= target).unwrap_or(false)
+            };
+        audio_ready && video_ready
+    }
 
-            if a_acked && v_acked {
-                let audio_ready = !self.has_audio
-                    || self.shared.audio_eof.load(Ordering::Relaxed)
-                    || self.shared.audio_buffered_hint.load(Ordering::Relaxed) >= audio_target;
-                let video_ready = !self.has_video
-                    || self.shared.eof.load(Ordering::Relaxed)
-                    || {
-                        let q = self.shared.video_q.lock().unwrap();
-                        q.front().map(|f| f.pts + 0.1 >= target).unwrap_or(false)
-                    };
-                if audio_ready && video_ready {
-                    return;
-                }
+    /// Tunggu singkat (maks `max_wait`, misal 8-16ms) sampai seek siap.
+    /// Jika belum siap setelah `max_wait`, langsung return `false` supaya
+    /// UI thread Python TIDAK FREEZE saat scrubbing VP9 dengan GOP panjang;
+    /// `poll_seek_resume()` akan otomatis menyalakan stream audio begitu
+    /// decode thread selesai mengejar target di tick UI berikutnya.
+    fn wait_for_seek_ready_brief(&self, target: f64, expected_seq: u64, max_wait: Duration) -> bool {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if self.is_seek_ready(target, expected_seq) {
+                return true;
             }
-            thread::sleep(Duration::from_millis(4));
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_seek_resume(&mut self) {
+        if self.shared.seek_resuming.swap(false, Ordering::SeqCst) {
+            if self.shared.playing.load(Ordering::Relaxed) {
+                if let Some(stream) = self._audio_stream.as_ref() {
+                    let _ = stream.play();
+                }
+                *self.shared.clock_base_wall.lock().unwrap() = Some(Instant::now());
+            }
+        }
+    }
+
+    fn poll_seek_resume(&mut self) {
+        if !self.shared.seek_resuming.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.shared.playing.load(Ordering::Relaxed) {
+            self.shared.seek_resuming.store(false, Ordering::SeqCst);
+            return;
+        }
+        let seq = self.shared.seek_seq.load(Ordering::SeqCst);
+        let target = *self.shared.seek_target.lock().unwrap();
+        if self.is_seek_ready(target, seq) {
+            self.finish_seek_resume();
+        } else {
+            // Fallback safety: jika video sangat berat tetapi audio sudah siap dan
+            // sudah ada minimal 1 frame di video_q (atau audio-only), resume saja.
+            let v_has_any = !self.has_video || !self.shared.video_q.lock().unwrap().is_empty();
+            let a_acked = !self.has_audio
+                || self.shared.audio_acked_seq.load(Ordering::SeqCst) >= seq;
+            let v_acked = !self.has_video
+                || self.shared.video_acked_seq.load(Ordering::SeqCst) >= seq;
+            if a_acked && v_acked && v_has_any {
+                self.finish_seek_resume();
+            }
         }
     }
 }
@@ -1628,12 +1739,9 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
     };
     let mut vdecoder = {
         let stream = input_ctx.streams().best(ffmpeg_next::media::Type::Video).unwrap();
-        match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-            .ok()
-            .and_then(|ctx| ctx.decoder().video().ok())
-        {
-            Some(d) => d,
-            None => return,
+        match open_multithreaded_video_decoder(stream.parameters()) {
+            Ok(d) => d,
+            Err(_) => return,
         }
     };
     let vwidth = vdecoder.width();
@@ -1689,12 +1797,28 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
             shared.eof.store(false, Ordering::Relaxed);
             sent_eof = false;
             video_skip_until = Some(sec);
+            // Saat catching up dari keyframe ke titik seek (khususnya VP9 GOP panjang),
+            // matikan loop filter (deblocking) dan lewati non-ref frames agar decode
+            // catch-up jauh lebih kencang, lalu normalkan kembali begitu sampai di titik seek.
+            unsafe {
+                (*vdecoder.as_mut_ptr()).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONKEY;
+                (*vdecoder.as_mut_ptr()).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_NONREF;
+            }
             packet_iter = Some(input_ctx.packets()); // iterator baru, mulai dari posisi abis seek
             applied_seek_seq = current_seq;
             shared.video_acked_seq.store(current_seq, Ordering::SeqCst);
         }
 
-        if !shared.playing.load(Ordering::Relaxed) {
+        // Saat paused, jika masih ada `video_skip_until` (baru saja di-seek saat posisi
+        // paused / scrubbing), TETAP lanjutkan decode sampai mendapat 1 frame pada posisi
+        // seek agar preview video langsung ter-update dan tidak freeze di frame lama!
+        let is_playing = shared.playing.load(Ordering::Relaxed);
+        let need_paused_seek_frame = !is_playing
+            && video_skip_until.is_some()
+            && shared.video_q.lock().unwrap().is_empty()
+            && !shared.eof.load(Ordering::Relaxed);
+
+        if !is_playing && !need_paused_seek_frame {
             if shared.step_request.swap(false, Ordering::SeqCst) {
                 // Frame-step: paksa decode satu frame video ke depan meski
                 // lagi paused, lalu geser clock persis ke pts frame itu --
@@ -1745,6 +1869,10 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
             Some(p) => p,
             None => {
                 if !sent_eof {
+                    unsafe {
+                        (*vdecoder.as_mut_ptr()).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT;
+                        (*vdecoder.as_mut_ptr()).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT;
+                    }
                     let _ = vdecoder.send_eof();
                     sent_eof = true;
                     // [FIX] Sama kayak audio_decode_loop: abis send_eof(),
@@ -1754,10 +1882,29 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                     // Sebelumnya ini gak dipanggil -> beberapa frame
                     // terakhir video ilang juga (gak seketara audio krn gak
                     // ada log-nya, tapi bug-nya sama persis).
+                    let mut last_dropped: Option<ffmpeg_next::frame::Video> = None;
                     while vdecoder.receive_frame(&mut vframe).is_ok() {
                         let pts = vframe.pts().or_else(|| vframe.timestamp()).unwrap_or(0) as f64 * vtb;
+                        if let Some(target_sec) = video_skip_until {
+                            if pts + 0.035 < target_sec {
+                                last_dropped = Some(vframe.clone());
+                                continue;
+                            }
+                            video_skip_until = None;
+                        }
                         if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                             shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                        }
+                    }
+                    // Jika seek terlalu dekat dengan EOF sehingga semua sisa frame < target_sec,
+                    // tetap tampilkan frame terakhir agar video tidak freeze kosong.
+                    if video_skip_until.is_some() {
+                        video_skip_until = None;
+                        if let Some(df) = last_dropped {
+                            let pts = df.pts().or_else(|| df.timestamp()).unwrap_or(0) as f64 * vtb;
+                            if let Ok(rgb) = scale_to_rgb(&df, &mut scaler, vdecoder.format(), vwidth, vheight) {
+                                shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                            }
                         }
                     }
                     eprintln!(
@@ -1795,9 +1942,17 @@ fn video_decode_loop(file_path: String, shared: Arc<Shared>) {
                         continue;
                     }
                     video_skip_until = None;
+                    unsafe {
+                        (*vdecoder.as_mut_ptr()).skip_loop_filter = ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT;
+                        (*vdecoder.as_mut_ptr()).skip_frame = ffmpeg_next::ffi::AVDiscard::AVDISCARD_DEFAULT;
+                    }
                 }
                 if let Ok(rgb) = scale_to_rgb(&vframe, &mut scaler, vdecoder.format(), vwidth, vheight) {
                     shared.video_q.lock().unwrap().push_back(QueuedFrame { rgb, pts });
+                    // Jika sedang paused (scrubbing saat pause), cukup 1 frame di titik seek.
+                    if !shared.playing.load(Ordering::Relaxed) {
+                        break;
+                    }
                 }
             }
         }
@@ -2195,7 +2350,7 @@ fn scale_to_rgb(
             let ctx = ffmpeg_next::software::scaling::Context::get(
                 src_format, width, height,
                 ffmpeg_next::util::format::Pixel::RGB24, width, height,
-                ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
             )?;
             scaler_slot.insert(ctx)
         }
@@ -2208,13 +2363,18 @@ fn scale_to_rgb(
 
     let stride = rgb_frame.stride(0);
     let row_width = (width as usize) * 3;
-    let mut data = Vec::with_capacity((height as usize) * row_width);
+    let total_bytes = (height as usize) * row_width;
     let raw_data = rgb_frame.data(0);
-    for y in 0..(height as usize) {
-        let start = y * stride;
-        data.extend_from_slice(&raw_data[start..start + row_width]);
+    if stride == row_width && raw_data.len() >= total_bytes {
+        Ok(raw_data[..total_bytes].to_vec())
+    } else {
+        let mut data = Vec::with_capacity(total_bytes);
+        for y in 0..(height as usize) {
+            let start = y * stride;
+            data.extend_from_slice(&raw_data[start..start + row_width]);
+        }
+        Ok(data)
     }
-    Ok(data)
 }
 
 // ═══════════════════════════════════════════════
@@ -3382,9 +3542,7 @@ fn generate_thumbnails(
     let time_base = rational_to_f64(stream.time_base());
     let duration = stream.duration() as f64 * time_base;
 
-    let ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())
-        .map_err(|e| PyRuntimeError::new_err(format!("Konteks dekoder: {}", e)))?;
-    let mut decoder = ctx.decoder().video()
+    let mut decoder = open_multithreaded_video_decoder(stream.parameters())
         .map_err(|e| PyRuntimeError::new_err(format!("Buat dekoder: {}", e)))?;
     let src_format = decoder.format();
     let (src_w, src_h) = (decoder.width(), decoder.height());
@@ -3407,7 +3565,7 @@ fn generate_thumbnails(
     let mut scaler = ffmpeg_next::software::scaling::Context::get(
         src_format, src_w, src_h,
         ffmpeg_next::util::format::Pixel::RGB24, dst_w, dst_h,
-        ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+        ffmpeg_next::software::scaling::flag::Flags::FAST_BILINEAR,
     ).map_err(|e| PyRuntimeError::new_err(format!("Buat scaler thumbnail: {}", e)))?;
 
     let mut results: Vec<(Py<PyArray3<u8>>, f64)> = Vec::with_capacity(count);
@@ -3426,7 +3584,7 @@ fn generate_thumbnails(
         let mut got_frame = false;
         let mut packet_count = 0;
         'search: for (s, packet) in input_ctx.packets() {
-            if packet_count > 200 { break; }
+            if packet_count > 1000 { break; }
             if s.index() != stream_idx {
                 packet_count += 1;
                 continue;
@@ -3437,7 +3595,8 @@ fn generate_thumbnails(
             }
             while decoder.receive_frame(&mut decoded).is_ok() {
                 got_frame = true;
-                if decoded.timestamp().unwrap_or(0) >= target_ts {
+                let ts = decoded.pts().or_else(|| decoded.timestamp()).unwrap_or(0);
+                if ts >= target_ts {
                     break 'search;
                 }
             }
