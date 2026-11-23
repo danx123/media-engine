@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ffmpeg-windows
-          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v25-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
+          key: ffmpeg-windows-${{ env.FFMPEG_TAG }}-v26-mp3lame-vorbis-${{ hashFiles('.github/workflows/build.yml') }}
 
       - name: 🎬 Kompilasi libdav1d statis (cross ke Windows)
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
@@ -163,7 +163,9 @@ jobs:
             --enable-libdav1d \
             --enable-libmp3lame \
             --enable-libvorbis \
-            --extra-cflags="-I$HOME/ffmpeg-windows/include" \
+            --enable-asm \
+            --enable-x86asm \
+            --extra-cflags="-O3 -I$HOME/ffmpeg-windows/include" \
             --extra-ldflags="-L$HOME/ffmpeg-windows/lib" \
             --pkg-config="pkg-config --static" 
             
