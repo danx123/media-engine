@@ -2,7 +2,7 @@
 
 A native Rust extension module for the **Macan Angkasa** suite, built with [PyO3](https://pyo3.rs)/[Maturin](https://www.maturin.rs). It wraps [FFmpeg](https://ffmpeg.org) (via `ffmpeg-next`) and a small real-time audio pipeline (via `cpal` + `ringbuf`) to handle performance-critical media work that isn't practical to do efficiently in pure Python: full audio/video playback, batch thumbnailing, waveform/BPM/spectrum analysis, loudness measurement, and audio/video transcoding.
 
-Built as an `abi3-py310` extension, so a single compiled wheel works across Python 3.10+. Current version: **0.5.4**.
+Built as an `abi3-py310` extension, so a single compiled wheel works across Python 3.10+. Current version: **0.5.5**.
 
 ## Why this exists
 
