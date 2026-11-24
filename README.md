@@ -26,19 +26,21 @@ It also consolidates what used to be separate native pieces and subprocess calls
 - **`AudioInfo`**: fast probe of the audio stream (duration, codec, sample rate, channels, bitrate) without decoding samples. Duration and bitrate fall back to container-level values when the stream doesn't carry them (e.g. some CBR MP3s).
 
 ### Single-frame decoding
-- **`VideoDecoder`**: single-frame `seek_frame(second)` / `read_next_frame()`, for one-off thumbnails such as seekbar hover previews. Seeking uses `AV_TIME_BASE` units for the demuxer and the stream time base for frame matching.
+- **`VideoDecoder`**: single-frame `seek_frame(second)` / `read_next_frame()`, for one-off thumbnails such as seekbar hover previews. Exposes `duration`, `width`, `height` and `codec` as read-only attributes. Seeking uses `AV_TIME_BASE` units for the demuxer and the stream time base for frame matching. The decoder runs with frame + slice multithreading (2-16 threads, depending on core count).
 - **`generate_thumbnails`**: N evenly spaced thumbnails in one pass with a single scaler sized for the whole batch (optional `max_width`, aspect ratio preserved). Failed seeks are skipped instead of failing the whole call, which suits gallery/grid previews.
 
 ### Playback: `PlayerEngine`
 Drives synchronized video and audio decode on **separate threads, each with its own file handle**, so heavy video work (large keyframes, post-seek catch-up) can never starve the audio ring buffer.
 
 - Play / pause / stop / seek / loop / frame-step
+- **Non-blocking seek**: `seek()` waits at most ~8 ms for both decoders to be ready and then returns, so scrubbing never freezes the UI thread (even on long-GOP VP9/AV1). While a seek is still catching up, the audio stream stays paused and is resumed automatically from `position()` / `get_frame()` as soon as both sides are ready
 - **Video is optional**: audio-only files (mp3, flac, wav, ...) play normally; `has_video` is `False` and `width`/`height`/`fps` are `0`
+- **Multithreaded video decode**: frame + slice threading, and a faster catch-up path after seeks (loop filter and non-reference frames are skipped until the target position is reached, then restored)
 - **Network sources**: FFmpeg network protocols are initialized, so `http(s)` URLs (radio streams, podcasts) can be opened directly
 - **Variable playback speed**: `set_playback_rate(0.25 .. 4.0)` using WSOLA time-stretching, so pitch is preserved. Changing speed needs no flush or seek, and the master clock counts *source* time, so video follows automatically
 - **10-band equalizer** with preamp (`set_equalizer` / `clear_equalizer`): RBJ peaking biquads at 60, 170, 310, 600, 1k, 3k, 6k, 12k, 14k and 16k Hz, ±20 dB, Q = 1.41. Safe to change while playing
 - Volume and mute, independent of the OS mixer (mute doesn't lose the volume value)
-- A/V sync with the audio clock as master (wall clock for video-only content or if the audio device is unavailable), including late-frame dropping, gap padding, and drift correction from audio PTS
+- A/V sync with the audio clock as master (wall clock for video-only content or if the audio device is unavailable), including late-frame dropping (frames more than 100 ms late), gap padding (silence is injected when audio PTS jumps ahead by more than 40 ms, capped at 30 s), and drift correction from audio PTS
 - Lock-free audio delivery: decode thread → SPSC `ringbuf` → `cpal` callback
 - Live FFT spectrum of what is currently playing (`get_spectrum`), fed from a separate bounded visualization ring so it never interferes with playback
 - Full-drain EOF detection (`is_eof`) that waits for both video and audio to finish, so callers don't cut off the audio tail
@@ -47,7 +49,7 @@ Drives synchronized video and audio decode on **separate threads, each with its 
 - **`analyze_waveform(path, target_points)`**: decodes once at 22.05 kHz mono; returns a normalized RMS envelope and an estimated BPM (`0.0` if undetectable).
 - **`decode_audio(path, out_rate)`**: whole track as mono `float32` in `[-1, 1]`, resampled to `out_rate`.
 - **`compute_waveform_envelope(samples, target_points)`**: operates on an array you already have; returns raw `(mins, maxs, rmss, firsts)` per column, suited to zoomable waveform rendering.
-- **`detect_bpm(samples, sample_rate)`**: onset-energy + autocorrelation over 60–200 BPM. Works best on music with a clear beat; unreliable for ambient or rubato material.
+- **`detect_bpm(samples, sample_rate)`**: onset-energy + autocorrelation over 60-200 BPM. Works best on music with a clear beat; unreliable for ambient or rubato material.
 - **`SpectrumAnalyzer(fft_size)`**: reusable FFT analyzer (Hann window, precomputed plan). `.compute(samples)` returns **linear** magnitudes of length `fft_size // 2 + 1`. Note that `PlayerEngine.get_spectrum()` returns **dB** instead.
 - **`analyze_loudness(path)`**: peak and RMS in dBFS (floored at -120 dB). Not EBU R128 LUFS; intended for "normalize volume" style features.
 
@@ -58,7 +60,7 @@ Native transcode/remux with per-track stream copy or full transcode:
 - `video_bitrate` / `audio_bitrate`: bits per second (transcode only)
 - `drop_video` / `drop_audio`: e.g. extract audio only
 - `trim_start` / `trim_end`: seconds; output timeline restarts at 0
-- `progress_callback(percent: float)`: throttled to ~0.5% steps, with a final `100.0`. Never called if the duration is unknown
+- `progress_callback(percent: float)`: intermediate calls are throttled to ~0.5% steps and only happen when the duration is known. A final `100.0` is always sent when the conversion completes, even if the duration is unknown, so callers without a known duration should treat the callback as a "finished" signal only
 - Audio is re-chunked through an internal FIFO to the encoder's exact `frame_size` (needed for e.g. AAC → MP3, where frame sizes differ)
 
 > Encoders must be compiled into the FFmpeg build. See [Codec availability](#codec-availability).
@@ -77,9 +79,9 @@ from media_engine import (
 |---|---|
 | `MediaInfo(path)` | `.duration .width .height .fps .codec .codec_id .bitrate` |
 | `AudioInfo(path)` | `.duration .codec .codec_id .sample_rate .channels .bitrate` |
-| `VideoDecoder(path)` | `.seek_frame(sec)`, `.read_next_frame()` → `ndarray[H,W,3] uint8`. **Unsendable** |
+| `VideoDecoder(path)` | attrs: `duration width height codec`. `.seek_frame(sec)`, `.read_next_frame()` → `ndarray[H,W,3] uint8`. **Unsendable** |
 | `PlayerEngine(path)` | attrs: `duration width height fps has_audio has_video`. **Unsendable** |
-| `.play() .pause() .stop() .seek(sec) .position()` | transport and clock |
+| `.play() .pause() .stop() .seek(sec) .position()` | transport and clock. `seek()` is non-blocking; `stop()` = pause + seek to 0 |
 | `.is_playing() .is_eof()` | state |
 | `.set_loop(bool) .is_looping()` | auto-restart at EOF |
 | `.step_frame()` | one frame forward, only while paused |
@@ -101,9 +103,11 @@ from media_engine import (
 ### Usage notes
 
 - `PlayerEngine` and `VideoDecoder` are `unsendable`: use them only on the thread that created them. If one lives in a Qt worker thread, create it *inside* that thread and release it there too (see the thumbnail worker in `player_engine_test.py`).
+- **Keep polling `position()` and/or `get_frame()` (e.g. from a ~10 ms timer).** After a `seek()` or a `play()` that has to wait for the decoders, these calls are what finish the resume and restart the audio stream. Without polling, audio can stay paused after a seek.
+- While **paused**, `get_frame()` returns only one frame after a `seek()` or `step_frame()` and does not drain the readahead queue, so resuming doesn't jump ahead of the audio.
 - Keep a reference to the array returned by `get_frame()` for as long as a `QImage` built on it is alive.
-- `step_frame()` does nothing for audio-only files.
-- If the default output device can't be opened, `PlayerEngine` degrades to video-only playback instead of failing.
+- `step_frame()` does nothing for audio-only files, and `get_frame()` always returns `None` for them.
+- If the default output device can't be opened, or it doesn't offer an `f32` sample format, `PlayerEngine` degrades to video-only playback instead of failing (`has_audio` becomes `False`). For an audio-only file this means there is nothing to play.
 - Audio output always uses the system default device.
 
 ## Requirements
@@ -173,7 +177,7 @@ What `convert_media` (and decoding in general) can do depends on what was compil
 
 1. Installs the `mingw-w64` toolchain (posix threading variant, required because FFmpeg needs pthreads and the default `-win32` variant lacks it).
 2. Cross-compiles `libdav1d` (Meson/Ninja), `libmp3lame`, `libogg` and `libvorbis` as static libraries into `~/ffmpeg-windows`.
-3. Cross-compiles FFmpeg `n9.0` statically for `mingw32`, with `avdevice`, `avfilter`, programs, docs and hardware acceleration (DXVA2, D3D11VA/D3D12VA, MediaFoundation) disabled to keep build time down. The result is cached, keyed on the FFmpeg tag, a manual version marker in the cache key and a hash of the workflow file, so changing configure flags invalidates the cache automatically.
+3. Cross-compiles FFmpeg `n9.0` statically for `mingw32`, with `avdevice`, `avfilter`, programs, docs and hardware acceleration (DXVA2, D3D11VA/D3D12VA, MediaFoundation) disabled to keep build time down, then removes the installed `hwcontext_d3d12va.h` header so `bindgen` doesn't pick it up. The result is cached, keyed on the FFmpeg tag, a manual version marker in the cache key and a hash of the workflow file, so changing configure flags invalidates the cache automatically.
 4. Writes `.cargo/config.toml` with the mingw linker and the system/codec link arguments (grouped with `--start-group`/`--end-group` to resolve static library ordering).
 5. Sets `BINDGEN_EXTRA_CLANG_ARGS` to skip AMX/SIMD intrinsic headers that break `bindgen` on Clang 21 targeting mingw.
 6. Points `ffmpeg-sys-next` at the cross-compiled FFmpeg via `FFMPEG_DIR` and runs `maturin build --release --target x86_64-pc-windows-gnu`.
@@ -189,7 +193,7 @@ What `convert_media` (and decoding in general) can do depends on what was compil
 
 ## Testing
 
-`player_engine_test.py` is a PySide6 testbed for `PlayerEngine` (not production player code). It covers video and audio-only playback, seek, loop, frame-step, volume/mute, and a seekbar hover thumbnail built on `VideoDecoder` in its own worker thread.
+`player_engine_test.py` is a PySide6 testbed for `PlayerEngine` (not production player code). It covers video and audio-only playback, seek, loop, frame-step, volume/mute, and a seekbar hover thumbnail built on `VideoDecoder` in its own worker thread. It does **not** exercise playback rate, the equalizer or `get_spectrum()`; test those separately.
 
 ```bash
 pip install PySide6 numpy
@@ -209,14 +213,22 @@ LICENSE                       # MIT
 
 ## Design notes
 
-- **No lock on the audio callback.** Samples move from the decode thread to the real-time `cpal` callback through an SPSC ring buffer, not a `Mutex<VecDeque<f32>>`. EQ parameters reach the callback via a sequence counter plus `try_lock()`, so it never blocks. The time-stretcher's buffers are preallocated; its capacity is sized for the full 0.25–4.0 rate range.
-- **Separate video and audio threads, each with its own file handle.** Seeks are signalled with a generation counter rather than a consumed `Option`, so both threads can independently apply and acknowledge each seek. `play()` and `seek()` wait (bounded, ~450 ms) until both sides are ready before the audio stream is started, which avoids audio running ahead of video.
+- **No lock on the audio callback.** Samples move from the decode thread to the real-time `cpal` callback through an SPSC ring buffer, not a `Mutex<VecDeque<f32>>`. EQ parameters reach the callback via a sequence counter plus `try_lock()`, so it never blocks. The time-stretcher's buffers are preallocated; its capacity is sized for the full 0.25-4.0 rate range.
+- **Separate video and audio threads, each with its own file handle.** Seeks are signalled with a generation counter rather than a consumed `Option`, so both threads can independently apply and acknowledge each seek.
+- **Seek and play never block the caller for long.** `seek()` clears the video queue, resets the clock and flushes audio centrally (once), then waits at most ~8 ms (`play()`: ~16 ms) for both threads to acknowledge and buffer enough data (~100 ms of audio, first video frame at the target). If they aren't ready yet, the `cpal` stream stays paused and `poll_seek_resume()` (called from `position()` and `get_frame()`) starts it as soon as they are. This avoids audio running ahead of video without freezing the UI during long-GOP catch-up.
 - **Pause is not a discontinuity.** `pause()` freezes the clock without flushing the readahead buffer; `seek`, `step_frame` and loop-restart reset the clock *and* flush audio.
 - **Audio is the master clock.** It counts source frames actually played (rate-adjusted), and keeps advancing after audio EOF so trailing video frames can finish.
+- **Bounded readahead.** The video queue holds at most 90 frames (~3 s at 30 fps); the audio ring buffer holds ~3 s with backpressure at ~2 s.
 - **`rayon` for embarrassingly parallel chunked work.** Envelope/RMS computation, BPM energy/autocorrelation and loudness are the spots that benefit from `par_iter()` without a manually managed thread pool.
 - **Stream copy vs. transcode in `convert_media`.** Stream-copied tracks trim to the nearest keyframe before the requested start (fast, but not frame-exact; same limitation as `ffmpeg -ss` before `-i`). Frame-exact trimming requires transcoding that track.
 - **Resampling avoids mid-stream `flush()`.** Output frames are allocated large enough for upsampling, and leftover filter delay carries over to the next call, which avoids per-frame clicks.
 - **`generate_thumbnails` builds one scaler for the whole batch**, rather than re-deriving it per frame like `VideoDecoder::seek_frame`, which matters when generating many thumbnails at once.
+
+## Known limitations
+
+- `PlayerEngine.duration` (for files with video) and `MediaInfo.duration` come from the video stream only, with no container-level fallback. Containers that don't store a per-stream duration may report an invalid value. Only audio-only playback and `AudioInfo` fall back to the container duration.
+- Frame-step (`step_frame`) and the hover-preview `VideoDecoder` require a video stream.
+- `analyze_loudness` is a peak/RMS estimate, not LUFS.
 
 ## License
 
